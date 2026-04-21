@@ -1,0 +1,5 @@
+pandas
+git+https://github.com/bmxitalia/LTNtorch.git
+torch
+seaborn
+pm4py

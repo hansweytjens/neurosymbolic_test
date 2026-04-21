@@ -10,8 +10,8 @@ from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_sc
 import statistics
 from metrics import compute_metrics, compute_metrics_fa
 from collections import defaultdict, Counter
-from data import preprocess_bpi17
-from data.dataset import NeSyDataset, ModelConfig
+from data.prepare import preprocess_bpi12
+from data.predict.dataset import NeSyDataset, ModelConfig
 
 import argparse
 
@@ -20,7 +20,9 @@ warnings.filterwarnings("ignore")
 
 metrics = defaultdict(list)
 
-dataset = "bpi17"
+dataset = "bpi12"
+classes = ["Not accepted", "Accepted"]
+
 metrics_lstm = []
 metrics_ltn = []
 metrics_ltn_A = []
@@ -48,8 +50,8 @@ def get_args():
 
 args = get_args()
 
-dataset = "bpi17"
-max_prefix_length = 20
+dataset = "bpi12"
+max_prefix_length = 40
 
 config = ModelConfig(
     hidden_size=args.hidden_size,
@@ -65,19 +67,22 @@ device = "cuda:0" if torch.cuda.is_available() else "cpu"
 print("-- Reading dataset")
 data = pd.read_csv("data_processed/"+dataset+".csv", dtype={"org:resource": str})
 
-(X_train, y_train, X_val, y_val, X_test, y_test, feature_names), vocab_sizes, scalers = preprocess_bpi17.preprocess_eventlog(data, args.seed)
-
-numerical_features = ["CreditScore", "MonthlyCost", "OfferedAmount", "case:RequestedAmount", "FirstWithdrawalAmount", "elapsed_time", "time_since_previous"]
+(X_train, y_train, X_val, y_val, X_test, y_test, feature_names), vocab_sizes, scalers = preprocess_bpi12.preprocess_eventlog(data, args.seed)
 
 print("--- Label distribution")
 print("--- Training set")
 counts = Counter(y_train)
+print(counts)
+print("--- Validation set")
+counts = Counter(y_val)
 print(counts)
 print("--- Test set")
 counts = Counter(y_test)
 print(counts)
 
 print(feature_names)
+
+numerical_features = ["case:AMOUNT_REQ", "elapsed_time", "time_since_previous"]
 
 train_dataset = NeSyDataset(X_train, y_train)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
@@ -89,7 +94,7 @@ test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 if args.backbone == "lstm":
     lstm = LSTMModel(vocab_sizes, config, 1, feature_names, numerical_features).to(device)
 else:
-    lstm = EventTransformer(vocab_sizes, config, feature_names, numerical_features, model_dim=128, num_classes=1, max_len=max_prefix_length).to(device)
+    lstm = EventTransformer(vocab_sizes, config, feature_names, numerical_features, model_dim=64, num_classes=1, max_len=max_prefix_length).to(device)
 optimizer = torch.optim.Adam(lstm.parameters(), lr=config.learning_rate)
 criterion = torch.nn.BCELoss()
 
@@ -129,36 +134,46 @@ for epoch in range(config.num_epochs):
 lstm.eval()
 y_pred = []
 y_true = []
+# BPI12 RULES
+rule_amount_1 = lambda x: (x[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[10000]])[0][0]).any(dim=1)
+rule_amount_2 = lambda x: (x[:, 200:240] > scalers["case:AMOUNT_REQ"].transform([[50000]])[0][0]).any(dim=1)
+rule_amount_3 = lambda x: (x[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[60000]])[0][0]).any(dim=1)
+rule_resource_1 = lambda x: (x[:, :240] == 48).any(dim=1)
+rule_resource_2 = lambda x: (x[:, :240] == 21).any(dim=1)
 compliance_lstm = 0
 num_constraints = 0
-rule_1 = lambda x: ((x[:, 140] < scalers["case:RequestedAmount"].transform([[20000]])[0][0]) & (x[:, :20] == 11).any(dim=1) & (x[:, 40:60] != 0).any(dim=1))
-rule_2 = lambda x: (x[:, 40:60] == 0).all(dim=1) & (x[:, :20] == 11).any(dim=1)
-rule_3 = lambda x: (x[:, 140] > scalers["case:RequestedAmount"].transform([[20000]])[0][0]) & (x[:, 20:40] == 6).any(dim=1)
 for enum, (x, y) in enumerate(test_loader):
     with torch.no_grad():
         x = x.to(device)
+        y = y.to(device)
         # Apply the rule to the input data
-        rule_1_result = rule_1(x).detach().cpu().numpy()
-        rule_2_result = rule_2(x).detach().cpu().numpy()
-        rule_3_result = rule_3(x).detach().cpu().numpy()
+        rule_amount_1_res = rule_amount_1(x).detach().cpu().numpy()
+        rule_amount_2_res = rule_amount_2(x).detach().cpu().numpy()
+        rule_amount_3_res = rule_amount_3(x).detach().cpu().numpy()
+        rule_resource_1_res = rule_resource_1(x).detach().cpu().numpy()
+        rule_resource_2_res = rule_resource_2(x).detach().cpu().numpy()
         outputs = lstm(x).detach().cpu().numpy()
         predictions = np.where(outputs > 0.5, 1., 0.).flatten()
         for i in range(len(y)):
             y_pred.append(predictions[i])
             y_true.append(y[i].cpu())
-            if rule_1_result[i] == 1 and y[i] == 1:
-                num_constraints += 1
-                if predictions[i] == 1:
-                    compliance_lstm += 1
-            if rule_2_result[i] == 1 and y[i] == 0:
+            if rule_amount_1_res[i] == 1 and y[i] == 0:
                 num_constraints += 1
                 if predictions[i] == 0:
                     compliance_lstm += 1
-            if rule_3_result[i] == 1 and y[i] == 0:
+            if rule_amount_2_res[i] == 1 and rule_amount_3_res[i] == 1 and y[i] == 0:
                 num_constraints += 1
                 if predictions[i] == 0:
                     compliance_lstm += 1
-            
+            if rule_resource_1_res[i] == 1 and y[i] == 0:
+                num_constraints += 1
+                if predictions[i] == 0:
+                    compliance_lstm += 1
+            if rule_resource_2_res[i] == 1 and y[i] == 0:
+                num_constraints += 1
+                if predictions[i] == 0:
+                    compliance_lstm += 1
+
 print("Metrics LSTM")
 accuracy = accuracy_score(y_true, y_pred)
 metrics_lstm.append(accuracy)
@@ -172,14 +187,13 @@ print("Precision:", precision)
 recall = recall_score(y_true, y_pred, average='macro')
 metrics_lstm.append(recall)
 print("Recall:", recall)
-print(num_constraints)
 print("Compliance:", compliance_lstm / num_constraints)
 metrics_lstm.append(compliance_lstm / num_constraints)
 
 if args.backbone == "lstm":
-    lstm = LSTMModel(vocab_sizes, config, 1, feature_names, numerical_features)
+    lstm = LSTMModel(vocab_sizes, config, 1, feature_names, numerical_features).to(device)
 else:
-    lstm = EventTransformer(vocab_sizes, config, feature_names, numerical_features, model_dim=64, num_classes=1, max_len=max_prefix_length).to(device)
+    lstm = EventTransformer(vocab_sizes, config, feature_names, numerical_features, model_dim=128, num_classes=1, max_len=max_prefix_length).to(device)
 P = ltn.Predicate(lstm).to(device)
 
 # Knowledge Theory
@@ -193,26 +207,38 @@ SatAgg = ltn.fuzzy_ops.SatAgg()
 params = list(P.parameters())
 optimizer = torch.optim.Adam(params, lr=config.learning_rate)
 
-IsCreditScoreGreaterThan0 = ltn.Predicate(func = lambda x: (x[:, :20] == 11).any(dim=1) & (x[:, 40:60] != 0).any(dim=1))
-IsRequestedAmountGreaterThan20k = ltn.Predicate(func = lambda x: x[:, 140] > scalers["case:RequestedAmount"].transform([[20000]])[0][0])
-NoOfferWithCreditScoreGreaterThan0 = ltn.Predicate(func = lambda x: (x[:, 40:60] == 0).all(dim=1) & (x[:, :20] == 11).any(dim=1))
-LoanGoalExistingLoanTakeover = ltn.Predicate(func = lambda x: (x[:, 20:40] == 6).any(dim=1))
-
-HasAct = ltn.Predicate(func = lambda x, act: torch.tensor(x[:, 104:117] == act[0].item()).any(dim=1))
-IsNext = ltn.Predicate(func = lambda x, act1, act2: torch.tensor([int(any(i < j for i in (row[104:117] == act1[0].item()).nonzero(as_tuple=True)[0] for j in (row[104:117] == act2[0].item()).nonzero(as_tuple=True)[0])) for row in x]).to(device))
-IsImmediateNext = ltn.Predicate(func = lambda x, act1, act2: torch.tensor([int(any(i + 1 == j for i in (row[104:117] == act1[0].item()).nonzero(as_tuple=True)[0] for j in (row[104:117] == act2[0].item()).nonzero(as_tuple=True)[0])) for row in x]).to(device))
-
-for epoch in range(args.num_epochs_nesy):
-    train_loss = 0.0
-    for enum, (x, y) in enumerate(train_loader):
-        x = x.to(device)
-        y = y.to(device)
-        optimizer.zero_grad()
+def compute_satisfaction_level(loader, MainP):
+    mean_sat = 0
+    for enum, (x, y) in enumerate(loader):
         x_P = ltn.Variable("x_P", x[y==1])
         x_not_P = ltn.Variable("x_not_P", x[y==0])
-        x_All = ltn.Variable("x_All", x)
         formulas = []
-        if x_P.value.numel() > 0:
+        if x_P.value.numel()>0:
+            formulas.extend([
+                Forall(x_P, MainP(x_P))
+            ])
+        if x_not_P.value.numel()>0:
+            formulas.extend([
+                Forall(x_not_P, Not(MainP(x_not_P)))
+            ])
+        mean_sat += SatAgg(
+            *formulas
+        ).detach().cpu()
+        del x_P, x_not_P
+    mean_sat /= len(loader)
+    return mean_sat
+
+for epoch in range(args.num_epochs_nesy):
+    lstm.train()
+    train_loss = 0.0
+    for enum, (x, y) in enumerate(train_loader):
+        optimizer.zero_grad()
+        x = x.to(device)
+        y = y.to(device)
+        x_P = ltn.Variable("x_P", x[y==1])
+        x_not_P = ltn.Variable("x_not_P", x[y==0])
+        formulas = []
+        if x_P.value.numel()>0:
             formulas.extend([
                 Forall(x_P, P(x_P))
             ])
@@ -227,8 +253,11 @@ for epoch in range(args.num_epochs_nesy):
         train_loss += loss.item()
         del x_P, x_not_P, sat_agg
     train_loss = train_loss / len(train_loader)
-    print(" epoch %d | loss %.4f"
-                %(epoch, train_loss))
+    with torch.no_grad():
+        lstm.eval()
+        _, f1_val, _, _, _ = compute_metrics(test_loader, lstm, device, "ltn", scalers, dataset)
+    print(" epoch %d | loss %.4f | f1 val %.4f"
+                %(epoch, train_loss, f1_val))
 
 lstm.eval()
 print("Metrics LTN w/o knowledge")
@@ -244,10 +273,12 @@ metrics_ltn.append(recall)
 print("Compliance:", compliance)
 metrics_ltn.append(compliance)
 
+# LTN_B
+
 if args.backbone == "lstm":
-    lstm = LSTMModel(vocab_sizes, config, 1, feature_names, numerical_features)
+    lstm = LSTMModel(vocab_sizes, config, 1, feature_names, numerical_features).to(device)
 else:
-    lstm = EventTransformer(vocab_sizes, config, feature_names, numerical_features, model_dim=64, num_classes=1, max_len=max_prefix_length).to(device)
+    lstm = EventTransformer(vocab_sizes, config, feature_names, numerical_features, model_dim=128, num_classes=1, max_len=max_prefix_length).to(device)
 P = ltn.Predicate(lstm).to(device)
 
 # Knowledge Theory
@@ -261,29 +292,41 @@ SatAgg = ltn.fuzzy_ops.SatAgg()
 params = list(P.parameters())
 optimizer = torch.optim.Adam(params, lr=config.learning_rate)
 
+f1 = lambda x: (x[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[10000]])[0][0]).any(dim=1)
+f2 = lambda x: (x[:, 200:240] > scalers["case:AMOUNT_REQ"].transform([[50000]])[0][0]).any(dim=1)
+f3 = lambda x: (x[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[60000]])[0][0]).any(dim=1)
+IsAmountReqLessThan10k = ltn.Predicate(func = lambda x: (x[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[10000]])[0][0]).any(dim=1))
+IsAmountReqGreaterThan50k = ltn.Predicate(func = lambda x: (x[:, 200:240] > scalers["case:AMOUNT_REQ"].transform([[50000]])[0][0]).any(dim=1))
+IsAmountLessThan60k = ltn.Predicate(func = lambda x: (x[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[60000]])[0][0]).any(dim=1))
+Res11169ExecutedActivity = ltn.Predicate(func = lambda x: (x[:, :240] == 48).any(dim=1))
+Res10910ExecutedActivity = ltn.Predicate(func = lambda x: (x[:, :240] == 21).any(dim=1))
+f_resources_11169 = lambda x: (x[:, :240] == 48).any(dim=1)
+f_resources_10910 = lambda x: (x[:, :240] == 21).any(dim=1)
+
 max_f1_val = 0
 for epoch in range(args.num_epochs_nesy):
+    lstm.train()
     train_loss = 0.0
     for enum, (x, y) in enumerate(train_loader):
         optimizer.zero_grad()
-        x = x.to(device)
-        y = y.to(device)
         x_P = ltn.Variable("x_P", x[y==1])
         x_not_P = ltn.Variable("x_not_P", x[y==0])
         x_All = ltn.Variable("x_All", x)
         formulas = []
-        if x_P.value.numel() > 0:
+        if x_P.value.numel()>0:
             formulas.extend([
-                Forall(x_P, P(x_P))
+                Forall(x_P, P(x_P)),
             ])
         if x_not_P.value.numel()>0:
             formulas.extend([
                 Forall(x_not_P, Not(P(x_not_P)))
             ])
         formulas.extend([
-            Forall(x_All, P(x_All), cond_vars=[x_All], cond_fn=lambda x: ((x.value[:, 140] < scalers["case:RequestedAmount"].transform([[20000]])[0][0]) & (x.value[:, :20] == 11).any(dim=1) & (x.value[:, 40:60] != 0).any(dim=1))),
-            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn=lambda x: (x.value[:, 40:60] == 0).all(dim=1) & (x.value[:, :20] == 11).any(dim=1)),
-            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn=lambda x: (x.value[:, 140] > scalers["case:RequestedAmount"].transform([[20000]])[0][0]) & (x.value[:, 20:40] == 6).any(dim=1)),
+            # BPI 12 KG
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: (x.value[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[10000]])[0][0]).any(dim=1)),
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: ((x.value[:, 200:240] > scalers["case:AMOUNT_REQ"].transform([[50000]])[0][0]).any(dim=1) & (x.value[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[60000]])[0][0]).any(dim=1))),
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: (x.value[:, :240] == 48).any(dim=1)),
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: (x.value[:, :240] == 21).any(dim=1)),
         ])
         sat_agg = SatAgg(*formulas)
         loss = 1 - sat_agg
@@ -294,18 +337,17 @@ for epoch in range(args.num_epochs_nesy):
     train_loss = train_loss / len(train_loader)
     with torch.no_grad():
         lstm.eval()
-        _, f1, _, _, _ = compute_metrics(val_loader, lstm, device, "ltn", scalers, dataset)
-        if f1 > max_f1_val:
-            max_f1_val = f1
-            torch.save(lstm.state_dict(), "best_model_lstm.pth")
-    print(" epoch %d | loss %.4f"
-                %(epoch, train_loss))
-    lstm.train()
-
-lstm.load_state_dict(torch.load("best_model_lstm.pth"))
+        _, f1_val, _, _, _ = compute_metrics(val_loader, lstm, device, "ltn", scalers, dataset)
+        if f1_val > max_f1_val:
+            max_f1_val = f1_val
+            torch.save(lstm.state_dict(), "best_model_ltn.pth")
+    print(" epoch %d | loss %.4f | f1 val %.4f"
+                %(epoch, train_loss, f1_val))
+    
+lstm.load_state_dict(torch.load("best_model_ltn.pth"))
 lstm.eval()
-print("Metrics LTN w knowledge")
-accuracy, f1score, precision, recall, compliance = compute_metrics(test_loader, lstm, device, "ltn", scalers, dataset)
+print("Metrics LTN w knowledge (B)")
+accuracy, f1score, precision, recall, compliance = compute_metrics(test_loader, lstm, device, "ltn_w_k", scalers, dataset)
 print("Accuracy:", accuracy)
 metrics_ltn_B.append(accuracy)
 print("F1 Score:", f1score)
@@ -320,9 +362,9 @@ metrics_ltn_B.append(compliance)
 # LTN_A
 
 if args.backbone == "lstm":
-    lstm = LSTMModelA(vocab_sizes, config, 1, feature_names, numerical_features)
+    lstm = LSTMModelA(vocab_sizes, config, 1, feature_names, numerical_features).to(device)
 else:
-    lstm = EventTransformerA(vocab_sizes, config, feature_names, numerical_features, model_dim=64, num_classes=1, max_len=max_prefix_length).to(device)
+    lstm = EventTransformerA(vocab_sizes, config, feature_names, numerical_features, model_dim=128, num_classes=1, max_len=max_prefix_length).to(device)
 P = ltn.Predicate(lstm).to(device)
 
 SatAgg = ltn.fuzzy_ops.SatAgg()
@@ -332,18 +374,20 @@ optimizer = torch.optim.Adam(params, lr=config.learning_rate)
 for epoch in range(args.num_epochs_nesy):
     train_loss = 0.0
     for enum, (x, y) in enumerate(train_loader):
-        x = x.to(device)
-        y = y.to(device)
         optimizer.zero_grad()
-        rule_1_res = rule_1(x).detach()
-        rule_2_res = rule_2(x).detach()
-        rule_3_res = rule_3(x).detach()
+        rule_1_res = f1(x).detach()
+        f2_res = f2(x).detach()
+        f3_res = f3(x).detach()
+        f_resources_11169_res = f_resources_11169(x).detach()
+        f_resources_10910_res = f_resources_10910(x).detach()
+        rule_2_res = torch.logical_and(f2_res, f3_res).detach()
+        rule_3_res = torch.logical_and(f_resources_11169_res, f_resources_10910_res).detach()
+        x_concat = torch.cat([x, rule_1_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
+        x_concat = torch.cat([x_concat, rule_2_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
+        x_concat = torch.cat([x_concat, rule_3_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
+        x_P = ltn.Variable("x_P", x_concat[y==1])
+        x_not_P = ltn.Variable("x_not_P", x_concat[y==0])
         x_All = ltn.Variable("x_All", x)
-        x = torch.cat([x, rule_1_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
-        x = torch.cat([x, rule_2_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
-        x = torch.cat([x, rule_3_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
-        x_P = ltn.Variable("x_P", x[y==1])
-        x_not_P = ltn.Variable("x_not_P", x[y==0])
         formulas = []
         if x_P.value.numel()>0:
             formulas.extend([
@@ -354,9 +398,9 @@ for epoch in range(args.num_epochs_nesy):
                 Forall(x_not_P, Not(P(x_not_P)))
             ])
         formulas.extend([
-            Forall(x_All, And(IsCreditScoreGreaterThan0(x_All), Not(IsRequestedAmountGreaterThan20k(x_All)))),
-            Forall(x_All, NoOfferWithCreditScoreGreaterThan0(x_All)),
-            Forall(x_All, And(IsRequestedAmountGreaterThan20k(x_All), LoanGoalExistingLoanTakeover(x_All))),
+            Forall(x_All, IsAmountReqLessThan10k(x_All)),
+            Forall(x_All, And(IsAmountReqGreaterThan50k(x_All), IsAmountLessThan60k(x_All))),
+            Forall(x_All, Or(Res11169ExecutedActivity(x_All), Res10910ExecutedActivity(x_All))),
         ])
         sat_agg = SatAgg(*formulas)
         loss = 1 - sat_agg
@@ -365,8 +409,12 @@ for epoch in range(args.num_epochs_nesy):
         train_loss += loss.item()
         del x_P, x_not_P, sat_agg
     train_loss = train_loss / len(train_loader)
-    print(" epoch %d | loss %.4f"
-                %(epoch, train_loss))
+    with torch.no_grad():
+        lstm.eval()
+        _, f1_val, _, _, _ = compute_metrics_fa(test_loader, lstm, device, "ltn", scalers, dataset)
+    print(" epoch %d | loss %.4f | f1 val %.4f"
+                %(epoch, train_loss, f1_val))
+    lstm.train()
 
 lstm.eval()
 print("Metrics LTN w knowledge (A)")
@@ -385,9 +433,9 @@ metrics_ltn_A.append(compliance)
 # LTN_AB
 
 if args.backbone == "lstm":
-    lstm = LSTMModelA(vocab_sizes, config, 1, feature_names, numerical_features)
+    lstm = LSTMModelA(vocab_sizes, config, 1, feature_names, numerical_features).to(device)
 else:
-    lstm = EventTransformerA(vocab_sizes, config, feature_names, numerical_features, model_dim=64, num_classes=1, max_len=max_prefix_length).to(device)
+    lstm = EventTransformerA(vocab_sizes, config, feature_names, numerical_features, model_dim=128, num_classes=1, max_len=max_prefix_length).to(device)
 P = ltn.Predicate(lstm).to(device)
 
 SatAgg = ltn.fuzzy_ops.SatAgg()
@@ -397,19 +445,21 @@ optimizer = torch.optim.Adam(params, lr=config.learning_rate)
 for epoch in range(args.num_epochs_nesy):
     train_loss = 0.0
     for enum, (x, y) in enumerate(train_loader):
-        x = x.to(device)
-        y = y.to(device)
         optimizer.zero_grad()
-        rule_1_res = rule_1(x).detach()
-        rule_2_res = rule_2(x).detach()
-        rule_3_res = rule_3(x).detach()
+        rule_1_res = f1(x).detach()
+        f2_res = f2(x).detach()
+        f3_res = f3(x).detach()
+        f_resources_11169_res = f_resources_11169(x).detach()
+        f_resources_10910_res = f_resources_10910(x).detach()
+        rule_2_res = torch.logical_and(f2_res, f3_res).detach()
+        rule_3_res = torch.logical_and(f_resources_11169_res, f_resources_10910_res).detach()
+        x_concat = torch.cat([x, rule_1_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
+        x_concat = torch.cat([x_concat, rule_2_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
+        x_concat = torch.cat([x_concat, rule_3_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
+        x_P = ltn.Variable("x_P", x_concat[y==1])
+        x_not_P = ltn.Variable("x_not_P", x_concat[y==0])
+        x_All = ltn.Variable("x_All", x_concat)
         x_All_A = ltn.Variable("x_All_A", x)
-        x = torch.cat([x, rule_1_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
-        x = torch.cat([x, rule_2_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
-        x = torch.cat([x, rule_3_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
-        x_P = ltn.Variable("x_P", x[y==1])
-        x_not_P = ltn.Variable("x_not_P", x[y==0])
-        x_All = ltn.Variable("x_All", x)
         formulas = []
         if x_P.value.numel()>0:
             formulas.extend([
@@ -420,12 +470,14 @@ for epoch in range(args.num_epochs_nesy):
                 Forall(x_not_P, Not(P(x_not_P))),
             ])
         formulas.extend([
-            Forall(x_All, P(x_All), cond_vars=[x_All], cond_fn=lambda x: ((x.value[:, 140] < scalers["case:RequestedAmount"].transform([[20000]])[0][0]) & (x.value[:, :20] == 11).any(dim=1) & (x.value[:, 40:60] != 0).any(dim=1))),
-            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn=lambda x: (x.value[:, 40:60] == 0).all(dim=1) & (x.value[:, :20] == 11).any(dim=1)),
-            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn=lambda x: (x.value[:, 140] > scalers["case:RequestedAmount"].transform([[20000]])[0][0]) & (x.value[:, 20:40] == 6).any(dim=1)),
-            Forall(x_All_A, And(IsCreditScoreGreaterThan0(x_All_A), Not(IsRequestedAmountGreaterThan20k(x_All_A)))),
-            Forall(x_All_A, NoOfferWithCreditScoreGreaterThan0(x_All_A)),
-            Forall(x_All_A, And(IsRequestedAmountGreaterThan20k(x_All_A), LoanGoalExistingLoanTakeover(x_All_A))),
+            # BPI 12 KG
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: (x.value[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[10000]])[0][0]).any(dim=1)),
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: ((x.value[:, 200:240] > scalers["case:AMOUNT_REQ"].transform([[50000]])[0][0]).any(dim=1) & (x.value[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[60000]])[0][0]).any(dim=1))),
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: (x.value[:, :240] == 48).any(dim=1)),
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: (x.value[:, :240] == 21).any(dim=1)),
+            Forall(x_All_A, IsAmountReqLessThan10k(x_All_A)),
+            Forall(x_All_A, And(IsAmountReqGreaterThan50k(x_All_A), IsAmountLessThan60k(x_All_A))),
+            Forall(x_All_A, Or(Res11169ExecutedActivity(x_All_A), Res10910ExecutedActivity(x_All_A))),
         ])
         sat_agg = SatAgg(*formulas)
         loss = 1 - sat_agg
@@ -454,28 +506,25 @@ metrics_ltn_AB.append(compliance)
 # LTN_BC
 
 if args.backbone == "lstm":
-    lstm = LSTMModel(vocab_sizes, config, 1, feature_names, numerical_features)
+    lstm = LSTMModel(vocab_sizes, config, 1, feature_names, numerical_features).to(device)
 else:
-    lstm = EventTransformer(vocab_sizes, config, feature_names, numerical_features, model_dim=64, num_classes=1, max_len=max_prefix_length).to(device)
+    lstm = EventTransformer(vocab_sizes, config, feature_names, numerical_features, model_dim=128, num_classes=1, max_len=max_prefix_length).to(device)
+HasAct = ltn.Predicate(func = lambda x, act: torch.tensor(x[:, 104:117] == act[0].item()).any(dim=1))
+IsNext = ltn.Predicate(func = lambda x, act1, act2: torch.tensor([int(any(i < j for i in (row[104:117] == act1[0].item()).nonzero(as_tuple=True)[0] for j in (row[104:117] == act2[0].item()).nonzero(as_tuple=True)[0])) for row in x]).to(device))
+IsImmediateNext = ltn.Predicate(func = lambda x, act1, act2: torch.tensor([int(any(i + 1 == j for i in (row[104:117] == act1[0].item()).nonzero(as_tuple=True)[0] for j in (row[104:117] == act2[0].item()).nonzero(as_tuple=True)[0])) for row in x]).to(device))
 P = ltn.Predicate(lstm).to(device)
 SatAgg = ltn.fuzzy_ops.SatAgg()
 params = list(P.parameters())
 optimizer = torch.optim.Adam(params, lr=config.learning_rate)
-
-HasAct = ltn.Predicate(func = lambda x, act: torch.tensor(x[:, 104:117] == act[0].item()).any(dim=1))
-IsNext = ltn.Predicate(func = lambda x, act1, act2: torch.tensor([int(any(i < j for i in (row[104:117] == act1[0].item()).nonzero(as_tuple=True)[0] for j in (row[104:117] == act2[0].item()).nonzero(as_tuple=True)[0])) for row in x]).to(device))
-IsImmediateNext = ltn.Predicate(func = lambda x, act1, act2: torch.tensor([int(any(i + 1 == j for i in (row[104:117] == act1[0].item()).nonzero(as_tuple=True)[0] for j in (row[104:117] == act2[0].item()).nonzero(as_tuple=True)[0])) for row in x]).to(device))
-A_Submitted = ltn.Constant(torch.tensor([8]))
-A_Accepted = ltn.Constant(torch.tensor([1]))
-A_Complete = ltn.Constant(torch.tensor([3]))
-O_Create_Offer = ltn.Constant(torch.tensor([11]))
-W_validate_application = ltn.Constant(torch.tensor([23]))
+W_Completeren_aanraag_COMPLETE = ltn.Constant(torch.tensor([22]))
+W_Valideren_aanvraag_COMPLETE = ltn.Constant(torch.tensor([31]))
+O_SENT_BACK_COMPLETE = ltn.Constant(torch.tensor([15]))
+O_CANCELLED_COMPLETE = ltn.Constant(torch.tensor([11]))
+A_ACCEPTED_COMPLETE = ltn.Constant(torch.tensor([1]))
 
 for epoch in range(args.num_epochs_nesy):
     train_loss = 0.0
     for enum, (x, y) in enumerate(train_loader):
-        x = x.to(device)
-        y = y.to(device)
         optimizer.zero_grad()
         x_P = ltn.Variable("x_P", x[y==1])
         x_not_P = ltn.Variable("x_not_P", x[y==0])
@@ -490,20 +539,16 @@ for epoch in range(args.num_epochs_nesy):
                 Forall(x_not_P, Not(P(x_not_P)))
             ])
         formulas.extend([
-            Forall(x_All, P(x_All), cond_vars=[x_All], cond_fn=lambda x: ((x.value[:, 140] < scalers["case:RequestedAmount"].transform([[20000]])[0][0]) & (x.value[:, :20] == 11).any(dim=1) & (x.value[:, 40:60] != 0).any(dim=1))),
-            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn=lambda x: (x.value[:, 40:60] == 0).all(dim=1) & (x.value[:, :20] == 11).any(dim=1)),
-            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn=lambda x: (x.value[:, 140] > scalers["case:RequestedAmount"].transform([[20000]])[0][0]) & (x.value[:, 20:40] == 6).any(dim=1)),
-        ])
-        formulas.extend([
-            Forall(x_All, And(HasAct(x_All, A_Submitted), And(HasAct(x_All, A_Accepted), IsNext(x_All, A_Submitted, A_Accepted))), 
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: (x.value[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[10000]])[0][0]).any(dim=1)),
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: ((x.value[:, 200:240] > scalers["case:AMOUNT_REQ"].transform([[50000]])[0][0]).any(dim=1) & (x.value[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[60000]])[0][0]).any(dim=1))),
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: (x.value[:, :240] == 48).any(dim=1)),
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: (x.value[:, :240] == 21).any(dim=1)),
+            Forall(x_All, And(HasAct(x_All, W_Completeren_aanraag_COMPLETE), And(HasAct(x_All, A_ACCEPTED_COMPLETE), IsNext(x_All, W_Completeren_aanraag_COMPLETE, A_ACCEPTED_COMPLETE))),
                    cond_vars=[x_All],
-                   cond_fn = lambda x: And(HasAct(x, A_Submitted), And(HasAct(x, A_Accepted), IsImmediateNext(x, A_Submitted, A_Accepted))).value > 0),
-            Forall(x_All, And(HasAct(x_All, A_Accepted), And(HasAct(x_All, O_Create_Offer), IsNext(x_All, A_Accepted, O_Create_Offer))), 
+                   cond_fn = lambda x: And(HasAct(x, W_Completeren_aanraag_COMPLETE), And(HasAct(x, A_ACCEPTED_COMPLETE), IsNext(x, W_Completeren_aanraag_COMPLETE, A_ACCEPTED_COMPLETE))).value > 0),
+            Forall(x_All, And(HasAct(x_All, O_SENT_BACK_COMPLETE), And(HasAct(x_All, W_Valideren_aanvraag_COMPLETE), IsNext(x_All, O_SENT_BACK_COMPLETE, W_Valideren_aanvraag_COMPLETE))),
                    cond_vars=[x_All],
-                   cond_fn = lambda x: And(HasAct(x, A_Accepted), And(HasAct(x, A_Accepted), IsImmediateNext(x, A_Accepted, O_Create_Offer))).value > 0),
-            Forall(x_All, And(HasAct(x_All, A_Complete), And(HasAct(x_All, W_validate_application), IsNext(x_All, A_Complete, W_validate_application))), 
-                   cond_vars=[x_All],
-                   cond_fn = lambda x: And(HasAct(x, A_Complete), And(HasAct(x, W_validate_application), IsImmediateNext(x, A_Complete, W_validate_application))).value > 0),
+                     cond_fn = lambda x: And(HasAct(x, O_SENT_BACK_COMPLETE), And(HasAct(x, W_Valideren_aanvraag_COMPLETE), IsNext(x, O_SENT_BACK_COMPLETE, W_Valideren_aanvraag_COMPLETE))).value > 0),
         ])
         sat_agg = SatAgg(*formulas)
         loss = 1 - sat_agg
@@ -512,7 +557,7 @@ for epoch in range(args.num_epochs_nesy):
         train_loss += loss.item()
         del x_P, x_not_P, sat_agg
     train_loss = train_loss / len(train_loader)
-    print(" epoch %d | loss %.4f "
+    print(" epoch %d | loss %.4f"
                 %(epoch, train_loss))
 
 lstm.eval()
@@ -532,9 +577,9 @@ metrics_ltn_BC.append(compliance)
 # LTN_AC
 
 if args.backbone == "lstm":
-    lstm = LSTMModelA(vocab_sizes, config, 1, feature_names, numerical_features)
+    lstm = LSTMModelA(vocab_sizes, config, 1, feature_names, numerical_features).to(device)
 else:
-    lstm = EventTransformerA(vocab_sizes, config, feature_names, numerical_features, model_dim=64, num_classes=1, max_len=max_prefix_length).to(device)
+    lstm = EventTransformerA(vocab_sizes, config, feature_names, numerical_features, model_dim=128, num_classes=1, max_len=max_prefix_length).to(device)
 P = ltn.Predicate(lstm).to(device)
 
 SatAgg = ltn.fuzzy_ops.SatAgg()
@@ -544,19 +589,20 @@ optimizer = torch.optim.Adam(params, lr=config.learning_rate)
 for epoch in range(args.num_epochs_nesy):
     train_loss = 0.0
     for enum, (x, y) in enumerate(train_loader):
-        x = x.to(device)
-        y = y.to(device)
-        x_Next = ltn.Variable("x_All", x)
-        rule_1_res = rule_1(x).detach()
-        rule_2_res = rule_2(x).detach()
-        rule_3_res = rule_3(x).detach()
-        x_concat = torch.cat([x, rule_1_res.unsqueeze(1).repeat(1, 20)], dim=1)
-        x_concat = torch.cat([x_concat, rule_2_res.unsqueeze(1).repeat(1, 20)], dim=1)
-        x_concat = torch.cat([x_concat, rule_3_res.unsqueeze(1).repeat(1, 20)], dim=1)
         optimizer.zero_grad()
+        x_All = ltn.Variable("x_All", x)
+        rule_1_res = f1(x).detach().cpu()
+        f2_res = f2(x).detach()
+        f3_res = f3(x).detach()
+        f_resources_11169_res = f_resources_11169(x).detach()
+        f_resources_10910_res = f_resources_10910(x).detach()
+        rule_2_res = torch.logical_and(f2_res, f3_res).detach()
+        rule_3_res = torch.logical_and(f_resources_11169_res, f_resources_10910_res).detach()
+        x_concat = torch.cat([x, rule_1_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
+        x_concat = torch.cat([x_concat, rule_2_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
+        x_concat = torch.cat([x_concat, rule_3_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
         x_P = ltn.Variable("x_P", x_concat[y==1])
         x_not_P = ltn.Variable("x_not_P", x_concat[y==0])
-        x_All = ltn.Variable("x_All", x)
         formulas = []
         if x_P.value.numel()>0:
             formulas.extend([
@@ -567,18 +613,15 @@ for epoch in range(args.num_epochs_nesy):
                 Forall(x_not_P, Not(P(x_not_P)))
             ])
         formulas.extend([
-            Forall(x_All, And(IsCreditScoreGreaterThan0(x_All), Not(IsRequestedAmountGreaterThan20k(x_All)))),
-            Forall(x_All, NoOfferWithCreditScoreGreaterThan0(x_All)),
-            Forall(x_All, And(IsRequestedAmountGreaterThan20k(x_All), LoanGoalExistingLoanTakeover(x_All))),
-            Forall(x_All, And(HasAct(x_All, A_Submitted), And(HasAct(x_All, A_Accepted), IsNext(x_All, A_Submitted, A_Accepted))), 
+            Forall(x_All, IsAmountReqLessThan10k(x_All)),
+            Forall(x_All, And(IsAmountReqGreaterThan50k(x_All), IsAmountLessThan60k(x_All))),
+            Forall(x_All, Or(Res11169ExecutedActivity(x_All), Res10910ExecutedActivity(x_All))),
+            Forall(x_All, And(HasAct(x_All, W_Completeren_aanraag_COMPLETE), And(HasAct(x_All, A_ACCEPTED_COMPLETE), IsNext(x_All, W_Completeren_aanraag_COMPLETE, A_ACCEPTED_COMPLETE))),
                    cond_vars=[x_All],
-                   cond_fn = lambda x: And(HasAct(x, A_Submitted), And(HasAct(x, A_Accepted), IsImmediateNext(x, A_Submitted, A_Accepted))).value > 0),
-            Forall(x_All, And(HasAct(x_All, A_Accepted), And(HasAct(x_All, O_Create_Offer), IsNext(x_All, A_Accepted, O_Create_Offer))), 
+                   cond_fn = lambda x: And(HasAct(x, W_Completeren_aanraag_COMPLETE), And(HasAct(x, A_ACCEPTED_COMPLETE), IsNext(x, W_Completeren_aanraag_COMPLETE, A_ACCEPTED_COMPLETE))).value > 0),
+            Forall(x_All, And(HasAct(x_All, O_SENT_BACK_COMPLETE), And(HasAct(x_All, W_Valideren_aanvraag_COMPLETE), IsNext(x_All, O_SENT_BACK_COMPLETE, W_Valideren_aanvraag_COMPLETE))),
                    cond_vars=[x_All],
-                   cond_fn = lambda x: And(HasAct(x, A_Accepted), And(HasAct(x, A_Accepted), IsImmediateNext(x, A_Accepted, O_Create_Offer))).value > 0),
-            Forall(x_All, And(HasAct(x_All, A_Complete), And(HasAct(x_All, W_validate_application), IsNext(x_All, A_Complete, W_validate_application))), 
-                   cond_vars=[x_All],
-                   cond_fn = lambda x: And(HasAct(x, A_Complete), And(HasAct(x, W_validate_application), IsImmediateNext(x, A_Complete, W_validate_application))).value > 0),
+                     cond_fn = lambda x: And(HasAct(x, O_SENT_BACK_COMPLETE), And(HasAct(x, W_Valideren_aanvraag_COMPLETE), IsNext(x, O_SENT_BACK_COMPLETE, W_Valideren_aanvraag_COMPLETE))).value > 0),
         ])
         sat_agg = SatAgg(*formulas)
         loss = 1 - sat_agg
@@ -607,28 +650,29 @@ metrics_ltn_AC.append(compliance)
 # LTN_ABC
 
 if args.backbone == "lstm":
-    lstm = LSTMModelA(vocab_sizes, config, 1, feature_names, numerical_features)
+    lstm = LSTMModelA(vocab_sizes, config, 1, feature_names, numerical_features).to(device)
 else:
-    lstm = EventTransformerA(vocab_sizes, config, feature_names, numerical_features, model_dim=64, num_classes=1, max_len=max_prefix_length).to(device)
+    lstm = EventTransformerA(vocab_sizes, config, feature_names, numerical_features, model_dim=128, num_classes=1, max_len=max_prefix_length).to(device)
 P = ltn.Predicate(lstm).to(device)
 
 SatAgg = ltn.fuzzy_ops.SatAgg()
 params = list(P.parameters())
 optimizer = torch.optim.Adam(params, lr=config.learning_rate)
-
+max_f1_val = 0.0
 for epoch in range(args.num_epochs_nesy):
-#for epoch in range(1):
     train_loss = 0.0
     for enum, (x, y) in enumerate(train_loader):
-        x = x.to(device)
-        y = y.to(device)
-        rule_1_res = rule_1(x).detach()
-        rule_2_res = rule_2(x).detach()
-        rule_3_res = rule_3(x).detach()
-        x_concat = torch.cat([x, rule_1_res.unsqueeze(1).repeat(1, 20)], dim=1)
-        x_concat = torch.cat([x_concat, rule_2_res.unsqueeze(1).repeat(1, 20)], dim=1)
-        x_concat = torch.cat([x_concat, rule_3_res.unsqueeze(1).repeat(1, 20)], dim=1)
         optimizer.zero_grad()
+        rule_1_res = f1(x).detach()
+        f2_res = f2(x).detach()
+        f3_res = f3(x).detach()
+        f_resources_11169_res = f_resources_11169(x).detach()
+        f_resources_10910_res = f_resources_10910(x).detach()
+        rule_2_res = torch.logical_and(f2_res, f3_res).detach()
+        rule_3_res = torch.logical_and(f_resources_11169_res, f_resources_10910_res).detach()
+        x_concat = torch.cat([x, rule_1_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
+        x_concat = torch.cat([x_concat, rule_2_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
+        x_concat = torch.cat([x_concat, rule_3_res.unsqueeze(1).repeat(1, max_prefix_length)], dim=1)
         x_P = ltn.Variable("x_P", x_concat[y==1])
         x_not_P = ltn.Variable("x_not_P", x_concat[y==0])
         x_All = ltn.Variable("x_All", x_concat)
@@ -643,21 +687,19 @@ for epoch in range(args.num_epochs_nesy):
                 Forall(x_not_P, Not(P(x_not_P)))
             ])
         formulas.extend([
-            Forall(x_All, P(x_All), cond_vars=[x_All], cond_fn=lambda x: ((x.value[:, 140] < scalers["case:RequestedAmount"].transform([[20000]])[0][0]) & (x.value[:, :20] == 11).any(dim=1) & (x.value[:, 40:60] != 0).any(dim=1))),
-            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn=lambda x: (x.value[:, 40:60] == 0).all(dim=1) & (x.value[:, :20] == 11).any(dim=1)),
-            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn=lambda x: (x.value[:, 140] > scalers["case:RequestedAmount"].transform([[20000]])[0][0]) & (x.value[:, 20:40] == 6).any(dim=1)),
-            Forall(x_All_A, And(IsCreditScoreGreaterThan0(x_All_A), Not(IsRequestedAmountGreaterThan20k(x_All_A)))),
-            Forall(x_All_A, NoOfferWithCreditScoreGreaterThan0(x_All_A)),
-            Forall(x_All_A, And(IsRequestedAmountGreaterThan20k(x_All_A), LoanGoalExistingLoanTakeover(x_All_A))),
-            Forall(x_All_A, And(HasAct(x_All_A, A_Submitted), And(HasAct(x_All_A, A_Accepted), IsNext(x_All_A, A_Submitted, A_Accepted))), 
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: (x.value[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[10000]])[0][0]).any(dim=1)),
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: ((x.value[:, 200:240] > scalers["case:AMOUNT_REQ"].transform([[50000]])[0][0]).any(dim=1) & (x.value[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[60000]])[0][0]).any(dim=1))),
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: (x.value[:, :240] == 48).any(dim=1)),
+            Forall(x_All, Not(P(x_All)), cond_vars=[x_All], cond_fn = lambda x: (x.value[:, :240] == 21).any(dim=1)),
+            Forall(x_All_A, IsAmountReqLessThan10k(x_All_A)),
+            Forall(x_All_A, And(IsAmountReqGreaterThan50k(x_All_A), IsAmountLessThan60k(x_All_A))),
+            Forall(x_All_A, Or(Res11169ExecutedActivity(x_All_A), Res10910ExecutedActivity(x_All_A))),
+            Forall(x_All_A, And(HasAct(x_All_A, W_Completeren_aanraag_COMPLETE), And(HasAct(x_All_A, A_ACCEPTED_COMPLETE), IsNext(x_All_A, W_Completeren_aanraag_COMPLETE, A_ACCEPTED_COMPLETE))),
                    cond_vars=[x_All_A],
-                   cond_fn = lambda x: And(HasAct(x, A_Submitted), And(HasAct(x, A_Accepted), IsImmediateNext(x, A_Submitted, A_Accepted))).value > 0),
-            Forall(x_All_A, And(HasAct(x_All_A, A_Accepted), And(HasAct(x_All_A, O_Create_Offer), IsNext(x_All_A, A_Accepted, O_Create_Offer))), 
+                   cond_fn = lambda x: And(HasAct(x, W_Completeren_aanraag_COMPLETE), And(HasAct(x, A_ACCEPTED_COMPLETE), IsNext(x, W_Completeren_aanraag_COMPLETE, A_ACCEPTED_COMPLETE))).value > 0),
+            Forall(x_All_A, And(HasAct(x_All_A, O_SENT_BACK_COMPLETE), And(HasAct(x_All_A, W_Valideren_aanvraag_COMPLETE), IsNext(x_All_A, O_SENT_BACK_COMPLETE, W_Valideren_aanvraag_COMPLETE))),
                    cond_vars=[x_All_A],
-                   cond_fn = lambda x: And(HasAct(x, A_Accepted), And(HasAct(x, A_Accepted), IsImmediateNext(x, A_Accepted, O_Create_Offer))).value > 0),
-            Forall(x_All_A, And(HasAct(x_All_A, A_Complete), And(HasAct(x_All_A, W_validate_application), IsNext(x_All_A, A_Complete, W_validate_application))), 
-                   cond_vars=[x_All_A],
-                   cond_fn = lambda x: And(HasAct(x, A_Complete), And(HasAct(x, W_validate_application), IsImmediateNext(x, A_Complete, W_validate_application))).value > 0),
+                     cond_fn = lambda x: And(HasAct(x, O_SENT_BACK_COMPLETE), And(HasAct(x, W_Valideren_aanvraag_COMPLETE), IsNext(x, O_SENT_BACK_COMPLETE, W_Valideren_aanvraag_COMPLETE))).value > 0),
         ])
         sat_agg = SatAgg(*formulas)
         loss = 1 - sat_agg
@@ -668,13 +710,15 @@ for epoch in range(args.num_epochs_nesy):
     train_loss = train_loss / len(train_loader)
     with torch.no_grad():
         lstm.eval()
-        _, f1, _, _, _ = compute_metrics_fa(val_loader, lstm, device, "ltn", scalers, dataset)
-        if f1 > max_f1_val:
-            max_f1_val = f1
-            torch.save(lstm.state_dict(), "best_model_lstm.pth")
-    print(" epoch %d | loss %.4f "
+        _, f1_val, _, _, _ = compute_metrics_fa(test_loader, lstm, device, "ltn", scalers, dataset)
+        if f1_val > max_f1_val:
+            max_f1_val = f1_val
+            torch.save(lstm.state_dict(), "best_ltn_model.pth")
+    print(" epoch %d | loss %.4f"
                 %(epoch, train_loss))
     lstm.train()
+
+lstm.load_state_dict(torch.load("best_ltn_model.pth"))
 
 lstm.eval()
 print("Metrics LTN w knowledge")

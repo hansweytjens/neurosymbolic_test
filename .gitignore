@@ -1,0 +1,40 @@
+# Auth / secrets
+.codex-auth.json
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Raw / downloaded data
+bpi12_extracted/
+data/prepare/*.zip
+data/prepare/*.gz
+data/prepare/*.xes
+data/prepare/*.xml
+data/prepare/*.csv
+
+# Processed / produced datasets
+data_processed/
+data/prepare/bpi12_raw.csv
+
+# Generated rule artifacts (produced by rules/discover_declare.py)
+data/rules/*.json
+data/rules/*.txt
+
+# Model checkpoints and outputs
+*.pt
+*.pth
+*.ckpt
+*.pkl
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment
+.env
+.venv/
+venv/
+*.egg-info/
+dist/
+build/

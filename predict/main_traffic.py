@@ -9,8 +9,8 @@ from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_sc
 import statistics
 from metrics import compute_metrics, compute_metrics_fa
 from collections import defaultdict, Counter
-from data import preprocess_traffic
-from data.dataset import NeSyDataset, ModelConfig
+from data.prepare import preprocess_traffic
+from data.predict.dataset import NeSyDataset, ModelConfig
 import argparse
 import logging
 
