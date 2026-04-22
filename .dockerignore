@@ -1,0 +1,39 @@
+# Git history
+.git/
+.gitattributes
+
+# Raw / downloaded data
+bpi12_extracted/
+data/
+
+# Processed datasets
+data_processed/
+
+# Model checkpoints and outputs
+checkpoints/
+model/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Dev / env artifacts
+.devcontainer/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.env
+.codex-auth.json
+
+# Docs
+README.md

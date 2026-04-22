@@ -140,7 +140,7 @@ def create_train_val_test_split(data, train_ratio=0.8, val_ratio=0.1, test_ratio
     test_ids = graph_ids[train_size + val_size:]
     return train_ids, test_ids
 
-def preprocess_eventlog(data, dataset_size=None):
+def preprocess_eventlog(data, seed=None, train_ids=None, val_ids=None, test_ids=None, dataset_size=None):
 
     vocab_sizes = {}
     admissions = data[data["concept:name"] == "ER Registration"]
@@ -149,9 +149,10 @@ def preprocess_eventlog(data, dataset_size=None):
     print(len(admission_ids))
     print("Number of patients: ", len(labels))
 
-    train_ids, test_ids = create_test_set(data)
-    data_train = data[data["case:concept:name"].isin(train_ids)]
-    train_ids, val_ids = create_test_set(data_train)
+    if train_ids is None or val_ids is None or test_ids is None:
+        train_ids, test_ids = create_test_set(data)
+        data_train = data[data["case:concept:name"].isin(train_ids)]
+        train_ids, val_ids = create_test_set(data_train)
 
     print("Number of patients in train set: ", len(train_ids))
     print("Number of patients in test set: ", len(test_ids))

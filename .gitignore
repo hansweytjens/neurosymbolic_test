@@ -22,6 +22,7 @@ data/rules/*.json
 data/rules/*.txt
 
 # Model checkpoints and outputs
+checkpoints/
 *.pt
 *.pth
 *.ckpt

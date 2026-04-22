@@ -132,7 +132,7 @@ def create_ngrams(data, train_ids, val_ids, test_ids, window_size=10):
 
     return ngrams_training, labels_training, ngrams_val, labels_val, ngrams_test, labels_test, feature_names
 
-def preprocess_eventlog(data, seed):
+def preprocess_eventlog(data, seed=42, train_ids=None, val_ids=None, test_ids=None):
 
     data = data.dropna(subset=["case:concept:name"])
     vocab_sizes = {}
@@ -152,9 +152,10 @@ def preprocess_eventlog(data, seed):
 
     print(data.columns)
 
-    train_ids, test_ids = create_test_set(data, seed)
-    data_train = data[data["case:concept:name"].isin(train_ids)]
-    train_ids, val_ids = create_test_set(data_train, seed)
+    if train_ids is None or val_ids is None or test_ids is None:
+        train_ids, test_ids = create_test_set(data, seed)
+        data_train = data[data["case:concept:name"].isin(train_ids)]
+        train_ids, val_ids = create_test_set(data_train, seed)
 
     print("Number of traces in train set: ", len(train_ids))
     print("Number of traces in test set: ", len(test_ids))

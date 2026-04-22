@@ -1,4 +1,5 @@
 import json
+import os
 import pandas as pd
 import torch
 import numpy as np
@@ -21,6 +22,7 @@ def get_args():
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--dropout_rate", type=float, default=0.1)
     parser.add_argument("--num_epochs", type=int, default=15)
+    parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -70,9 +72,15 @@ model = EventTransformer(vocab_sizes, config, feature_names, numerical_features,
 optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 criterion = torch.nn.BCELoss()
 
+os.makedirs("checkpoints", exist_ok=True)
+checkpoint_path = "checkpoints/baseline_bpi12_best.pt"
+
 model.train()
 training_losses = []
 validation_losses = []
+best_val_loss = float("inf")
+patience_counter = 0
+
 for epoch in range(config.num_epochs):
     train_losses = []
     for x, y in train_loader:
@@ -94,58 +102,37 @@ for epoch in range(config.num_epochs):
             output = model(x)
             loss = criterion(output.squeeze(1), y)
             val_losses.append(loss.item())
-    print(f"Validation Loss: {statistics.mean(val_losses)}")
-    validation_losses.append(statistics.mean(val_losses))
-    if epoch >= 5 and validation_losses[-1] > validation_losses[-2]:
-        print("Validation loss increased, stopping training")
-        break
+    mean_val_loss = statistics.mean(val_losses)
+    print(f"Validation Loss: {mean_val_loss}")
+    validation_losses.append(mean_val_loss)
+
+    if mean_val_loss < best_val_loss:
+        best_val_loss = mean_val_loss
+        patience_counter = 0
+        torch.save(model.state_dict(), checkpoint_path)
+    else:
+        patience_counter += 1
+        if patience_counter >= args.patience:
+            print(f"Early stopping: no improvement for {args.patience} epochs")
+            break
+
     model.train()
 
+model.load_state_dict(torch.load(checkpoint_path))
 model.eval()
 y_pred = []
 y_true = []
 
-rule_amount_1 = lambda x: (x[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[10000]])[0][0]).any(dim=1)
-rule_amount_2 = lambda x: (x[:, 200:240] > scalers["case:AMOUNT_REQ"].transform([[50000]])[0][0]).any(dim=1)
-rule_amount_3 = lambda x: (x[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[60000]])[0][0]).any(dim=1)
-rule_resource_1 = lambda x: (x[:, :240] == 48).any(dim=1)
-rule_resource_2 = lambda x: (x[:, :240] == 21).any(dim=1)
-
-compliance = 0
-num_constraints = 0
 for x, y in test_loader:
     with torch.no_grad():
         x, y = x.to(device), y.to(device)
-        r1 = rule_amount_1(x).cpu().numpy()
-        r2 = rule_amount_2(x).cpu().numpy()
-        r3 = rule_amount_3(x).cpu().numpy()
-        r4 = rule_resource_1(x).cpu().numpy()
-        r5 = rule_resource_2(x).cpu().numpy()
         outputs = model(x).cpu().numpy()
         predictions = np.where(outputs > 0.5, 1., 0.).flatten()
-        for i in range(len(y)):
-            y_pred.append(predictions[i])
-            y_true.append(y[i].cpu())
-            if r1[i] == 1 and y[i] == 0:
-                num_constraints += 1
-                if predictions[i] == 0:
-                    compliance += 1
-            if r2[i] == 1 and r3[i] == 1 and y[i] == 0:
-                num_constraints += 1
-                if predictions[i] == 0:
-                    compliance += 1
-            if r4[i] == 1 and y[i] == 0:
-                num_constraints += 1
-                if predictions[i] == 0:
-                    compliance += 1
-            if r5[i] == 1 and y[i] == 0:
-                num_constraints += 1
-                if predictions[i] == 0:
-                    compliance += 1
+        y_pred.extend(predictions.tolist())
+        y_true.extend(y.cpu().tolist())
 
 print("\n-- Baseline Results")
 print("Accuracy:", accuracy_score(y_true, y_pred))
 print("F1 Score:", f1_score(y_true, y_pred, average='macro'))
 print("Precision:", precision_score(y_true, y_pred, average='macro'))
 print("Recall:", recall_score(y_true, y_pred, average='macro'))
-print("Compliance:", compliance / num_constraints if num_constraints > 0 else "N/A")

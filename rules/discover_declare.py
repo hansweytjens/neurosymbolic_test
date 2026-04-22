@@ -88,7 +88,7 @@ def extract_constraints(declare_model, total_cases, positive_only=False):
         for activities, vals in entries.items():
             activities = list(activities) if isinstance(activities, tuple) else [activities]
             support    = round(vals["support"]    / total_cases, 4)
-            confidence = round(vals["confidence"] / total_cases, 4)
+            confidence = round(vals["confidence"] / vals["support"], 4) if vals["support"] else 0.0
             constraints.append({
                 "id":          f"c{i+1:04d}",
                 "template":    template_str,
@@ -175,6 +175,7 @@ def main():
         min_confidence_ratio=args.confidence,
     )
     constraints = extract_constraints(declare_model, total_cases, positive_only=args.positive_only)
+    constraints = [c for c in constraints if c["support"] >= args.support and c["confidence"] >= args.confidence]
     print(f"Found {len(constraints)} constraints.\n")
     print("Saving results...")
     save_json(constraints, args.dataset, args.support, args.confidence)

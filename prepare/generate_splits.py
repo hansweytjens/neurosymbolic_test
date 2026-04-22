@@ -12,6 +12,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 import pandas as pd
+from datasets.config import DATASET_REGISTRY
 
 # True  = create_test_set(data, seed, ratio=...)
 # False = create_test_set(data, ratio=...)  (sepsis hardcodes its own seed)
@@ -48,9 +49,10 @@ def main():
     args   = get_args()
     module_name, takes_seed = DATASETS[args.dataset]
     mod    = importlib.import_module(module_name)
+    read_kwargs = DATASET_REGISTRY[args.dataset].get("read_kwargs", {})
     data   = pd.read_csv(
         ROOT / "data_processed" / f"{args.dataset}.csv",
-        dtype={"org:resource": str},
+        **read_kwargs,
     )
 
     train_ids, val_ids, test_ids = split(data, mod, takes_seed, args.seed)

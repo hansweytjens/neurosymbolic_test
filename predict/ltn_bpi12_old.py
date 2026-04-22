@@ -11,6 +11,7 @@ the task loss so training dynamics can be compared with baseline_bpi12.py.
 """
 
 import json
+import os
 import statistics
 import argparse
 import warnings
@@ -53,6 +54,7 @@ def get_args():
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--dropout_rate", type=float, default=0.1)
     parser.add_argument("--num_epochs", type=int, default=15)
+    parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -235,7 +237,7 @@ with open(f"data_processed/{dataset}_splits.json") as f:
     splits = json.load(f)
 train_ids, val_ids, test_ids = splits["train_ids"], splits["val_ids"], splits["test_ids"]
 
-(X_train, y_train, X_val, y_val, X_test, y_test, feature_names), vocab_sizes, scalers = (
+(X_train, y_train, X_val, y_val, X_test, y_test, feature_names), vocab_sizes, _ = (
     preprocess_bpi12.preprocess_eventlog(
         data, args.seed, train_ids=train_ids, val_ids=val_ids, test_ids=test_ids
     )
@@ -291,9 +293,15 @@ criterion = nn.BCELoss()
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
+os.makedirs("checkpoints", exist_ok=True)
+level_str = "+".join(sorted(levels))
+checkpoint_path = f"checkpoints/ltn_bpi12_{level_str}_best.pt"
+
 model.train()
 training_losses    = []
 validation_losses  = []
+best_val_loss      = float("inf")
+patience_counter   = 0
 
 for epoch in range(config.num_epochs):
     train_losses  = []
@@ -304,21 +312,20 @@ for epoch in range(config.num_epochs):
         optimizer.zero_grad()
 
         ltn_feats = None
-        sat_agg_batch = 1.0
         if use_ltn_feats:
-            ltn_feats, sat_agg_batch = compute_batch_ltn(x, activity_vocab, activity_col_start, seq_len, device)
-            train_sat_agg.append(sat_agg_batch)
+            ltn_feats, _ = compute_batch_ltn(x, activity_vocab, activity_col_start, seq_len, device)
 
         output = model(x, ltn_feats)
         bce_loss = criterion(output.squeeze(1), y)
 
-        if use_loss and ltn_feats is not None and ltn_feats.numel() > 0:
-            # Per-trace violation score in [0, 1]: fraction of constraints violated
-            violation_scores = 1.0 - ltn_feats.mean(dim=1)  # (B,)
-            # Penalise confident positive predictions for constraint-violating traces.
-            # This term is differentiable w.r.t. model parameters.
-            ltn_loss = (output.squeeze(1) * violation_scores).mean()
-            loss = bce_loss + args.ltn_weight * ltn_loss
+        if use_ltn_feats and ltn_feats is not None and ltn_feats.numel() > 0:
+            violation_scores = 1.0 - ltn_feats.mean(dim=1)
+            train_sat_agg.append(1.0 - (output.squeeze(1).detach() * violation_scores).mean().item())
+            if use_loss:
+                ltn_loss = (output.squeeze(1) * violation_scores).mean()
+                loss = bce_loss + args.ltn_weight * ltn_loss
+            else:
+                loss = bce_loss
         else:
             loss = bce_loss
 
@@ -344,10 +351,12 @@ for epoch in range(config.num_epochs):
             x, y = x.to(device), y.to(device)
             ltn_feats = None
             if use_ltn_feats:
-                ltn_feats, sat_batch = compute_batch_ltn(x, activity_vocab, activity_col_start, seq_len, device)
-                val_sat_agg.append(sat_batch)
+                ltn_feats, _ = compute_batch_ltn(x, activity_vocab, activity_col_start, seq_len, device)
             output   = model(x, ltn_feats)
             val_loss = criterion(output.squeeze(1), y)
+            if use_ltn_feats and ltn_feats is not None and ltn_feats.numel() > 0:
+                violation_scores = 1.0 - ltn_feats.mean(dim=1)
+                val_sat_agg.append(1.0 - (output.squeeze(1) * violation_scores).mean().item())
             val_losses.append(val_loss.item())
 
     mean_val_loss = statistics.mean(val_losses)
@@ -358,25 +367,26 @@ for epoch in range(config.num_epochs):
     )
     validation_losses.append(mean_val_loss)
 
-    if epoch >= 5 and validation_losses[-1] > validation_losses[-2]:
-        print("Validation loss increased, stopping training")
-        break
+    if mean_val_loss < best_val_loss:
+        best_val_loss = mean_val_loss
+        patience_counter = 0
+        torch.save(model.state_dict(), checkpoint_path)
+    else:
+        patience_counter += 1
+        if patience_counter >= args.patience:
+            print(f"Early stopping: no improvement for {args.patience} epochs")
+            break
+
     model.train()
+
+model.load_state_dict(torch.load(checkpoint_path))
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 model.eval()
 y_pred = []
 y_true = []
-
-rule_amount_1  = lambda x: (x[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[10000]])[0][0]).any(dim=1)
-rule_amount_2  = lambda x: (x[:, 200:240] > scalers["case:AMOUNT_REQ"].transform([[50000]])[0][0]).any(dim=1)
-rule_amount_3  = lambda x: (x[:, 200:240] < scalers["case:AMOUNT_REQ"].transform([[60000]])[0][0]).any(dim=1)
-rule_resource_1 = lambda x: (x[:, :240] == 48).any(dim=1)
-rule_resource_2 = lambda x: (x[:, :240] == 21).any(dim=1)
-
-compliance    = 0
-num_constraints_checked = 0
+test_sat_agg = []
 
 for x, y in test_loader:
     with torch.no_grad():
@@ -386,34 +396,16 @@ for x, y in test_loader:
         if use_ltn_feats:
             ltn_feats, _ = compute_batch_ltn(x, activity_vocab, activity_col_start, seq_len, device)
 
-        r1 = rule_amount_1(x).cpu().numpy()
-        r2 = rule_amount_2(x).cpu().numpy()
-        r3 = rule_amount_3(x).cpu().numpy()
-        r4 = rule_resource_1(x).cpu().numpy()
-        r5 = rule_resource_2(x).cpu().numpy()
+        outputs     = model(x, ltn_feats)
+        predictions = np.where(outputs.cpu().numpy() > 0.5, 1.0, 0.0).flatten()
 
-        outputs     = model(x, ltn_feats).cpu().numpy()
-        predictions = np.where(outputs > 0.5, 1.0, 0.0).flatten()
+        if use_ltn_feats and ltn_feats is not None and ltn_feats.numel() > 0:
+            violation_scores = 1.0 - ltn_feats.mean(dim=1)
+            test_sat_agg.append(1.0 - (outputs.squeeze(1) * violation_scores).mean().item())
 
         for i in range(len(y)):
             y_pred.append(predictions[i])
             y_true.append(y[i].cpu())
-            if r1[i] == 1 and y[i] == 0:
-                num_constraints_checked += 1
-                if predictions[i] == 0:
-                    compliance += 1
-            if r2[i] == 1 and r3[i] == 1 and y[i] == 0:
-                num_constraints_checked += 1
-                if predictions[i] == 0:
-                    compliance += 1
-            if r4[i] == 1 and y[i] == 0:
-                num_constraints_checked += 1
-                if predictions[i] == 0:
-                    compliance += 1
-            if r5[i] == 1 and y[i] == 0:
-                num_constraints_checked += 1
-                if predictions[i] == 0:
-                    compliance += 1
 
 level_str = "+".join(sorted(levels))
 print(f"\n-- LTN Results ({level_str})")
@@ -421,7 +413,5 @@ print("Accuracy:", accuracy_score(y_true, y_pred))
 print("F1 Score:", f1_score(y_true, y_pred, average="macro"))
 print("Precision:", precision_score(y_true, y_pred, average="macro"))
 print("Recall:", recall_score(y_true, y_pred, average="macro"))
-print(
-    "Compliance:",
-    compliance / num_constraints_checked if num_constraints_checked > 0 else "N/A",
-)
+if test_sat_agg:
+    print("SatAgg (test):", statistics.mean(test_sat_agg))

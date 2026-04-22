@@ -5,40 +5,10 @@ import random
 
 def create_test_set(data, seed, ratio=0.2):
     random.seed(seed)
-    grouped = data.groupby("case:concept:name")
-    unique_groups = list(grouped.groups.keys())
-    labels = data.groupby("case:concept:name")["label"].first().to_list()
-
+    unique_groups = list(data.groupby("case:concept:name").groups.keys())
     len_test_set = int(len(unique_groups) * ratio)
-
-    labels_r1 = data.groupby("case:concept:name")["rule_1"].first().to_list()
-    labels_r2 = data.groupby("case:concept:name")["rule_2"].first().to_list()
-    labels_r3 = data.groupby("case:concept:name")["rule_3"].first().to_list()
-
-    filtered_values_r1 = [v for v, l, r in zip(unique_groups, labels, labels_r1) if (r == 1 and l == 0)]
-    filtered_values_r2 = [v for v, l, r in zip(unique_groups, labels, labels_r2) if (r == 1 and l == 0)]
-    filtered_values_r3 = [v for v, l, r in zip(unique_groups, labels, labels_r3) if (r == 1 and l == 0)]
-
-    filtered_values_nor = [v for v, l, r1, r2, r3 in zip(unique_groups, labels, labels_r1, labels_r2, labels_r3) if (r1 == 0 and r2 == 0 and r3 == 0 and l == 1)]
-
-    filtered_values = filtered_values_r1 + filtered_values_r2 + filtered_values_r3 + filtered_values_nor
-    compliant_ids = list(set(filtered_values_r1 + filtered_values_r2 + filtered_values_r3))
-    filtered_values = list(set(filtered_values))
-
-    print("Len filtered values: ", len(filtered_values))
-    if len(filtered_values) > len_test_set:
-        test_ids = random.sample(filtered_values, len_test_set)
-    else:
-        test_ids = filtered_values
-
+    test_ids = random.sample(unique_groups, len_test_set)
     training_ids = [x for x in unique_groups if x not in test_ids]
-    training_ids = list(set(training_ids))
-
-    compliant_training_ids = [x for x in training_ids if x in compliant_ids]
-    compliant_test_ids = [x for x in test_ids if x in compliant_ids]
-    print("Number of compliant traces in training set: ", len(compliant_training_ids))
-    print("Number of compliant traces in test set: ", len(compliant_test_ids))
-
     return training_ids, test_ids
 
 def create_ngrams(data, train_ids, val_ids, test_ids, window_size=40):
@@ -63,7 +33,7 @@ def create_ngrams(data, train_ids, val_ids, test_ids, window_size=40):
         if len(group) > window_size:
             group = group.iloc[:window_size]
 
-        group = group.drop(columns=["label", "case:concept:name", "time:timestamp", "concept:name_str", "rule_1", "rule_2", "rule_3"])
+        group = group.drop(columns=["label", "case:concept:name", "time:timestamp", "concept:name_str"])
 
         feature_names = group.columns.tolist()
         for n in range(1, len(group), 1):
@@ -82,7 +52,7 @@ def create_ngrams(data, train_ids, val_ids, test_ids, window_size=40):
         if len(group) > window_size:
             group = group.iloc[:window_size]
 
-        group = group.drop(columns=["label", "case:concept:name", "time:timestamp", "concept:name_str", "rule_1", "rule_2", "rule_3"])
+        group = group.drop(columns=["label", "case:concept:name", "time:timestamp", "concept:name_str"])
         
         feature_names = group.columns.tolist()
         for n in range(1, len(group), 1):
@@ -101,7 +71,7 @@ def create_ngrams(data, train_ids, val_ids, test_ids, window_size=40):
         if len(group) > window_size:
             group = group.iloc[:window_size]
 
-        group = group.drop(columns=["label", "case:concept:name", "time:timestamp", "concept:name_str", "rule_1", "rule_2", "rule_3"])
+        group = group.drop(columns=["label", "case:concept:name", "time:timestamp", "concept:name_str"])
         
         feature_names = group.columns.tolist()
         for n in range(1, len(group), 1):
@@ -154,10 +124,6 @@ def preprocess_eventlog(data, seed, train_ids=None, val_ids=None, test_ids=None,
     vocab_sizes["concept:name"] = data["concept:name"].max()
 
     data["org:resource"] = pd.Categorical(data["org:resource"])
-    res_11169 = data["org:resource"].cat.categories.get_loc("11169") + 1
-    print("11169 code: ", res_11169)
-    res_10910 = data["org:resource"].cat.categories.get_loc("10910") + 1
-    print("10910 code: ", res_10910)
     data["org:resource"] = data["org:resource"].cat.codes + 1
     vocab_sizes["org:resource"] = data["org:resource"].max()
 
