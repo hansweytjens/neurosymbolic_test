@@ -38,3 +38,91 @@ Execute the script of interest with following flags:
 Example for the *SEPSIS* event log with default parameters:
 
 ```python main_sepsis.py --model_type="lstm" --hidden_size=128 --num_layers=2 --seed=42```
+
+---
+
+## DECLARE Constraint Discovery and LTN Integration Pipeline
+
+This pipeline discovers process constraints from training data, filters them to only those that carry a net-positive discriminative signal on the validation set, and feeds the survivors into the LTN model as input features and a violation penalty.
+
+### Motivation
+
+Not all discovered constraints are useful for LTN. A constraint penalises both wrong predictions that violate it (good) and correct predictions that violate it (bad). A constraint is net-positive only when it catches more wrong predictions than correct ones **in absolute counts** — a condition that depends on the class imbalance of the prediction set and must be evaluated on held-out data.
+
+### Step 1 — Discover DECLARE constraints (training data only)
+
+```bash
+python rules/discover_declare.py --dataset bpi12
+```
+
+Mines constraints from the training split and writes `data/rules/bpi12_declare.json`. Configuration (per-template confidence floors, support threshold) lives in `DEFAULT_CONFIG` inside the script and can be overridden with a JSON file:
+
+```bash
+python rules/discover_declare.py --dataset bpi12 --config noncoex_095_override.json
+```
+
+### Step 2 — Score per-constraint discriminability (validation predictions)
+
+```bash
+python check_declare_violations.py \
+    --dataset bpi12 \
+    --predictions data/BPI12_student_model_val_prefix_predictions.csv
+```
+
+Use the **validation** set, never the test set — this step selects which constraints to include, making it a form of hyperparameter tuning. Using training predictions would introduce circularity (the constraints were mined from the same data).
+
+Outputs:
+- `data/BPI12_student_model_val_declare_violation_analysis.csv` — per-row violation flags
+- `data/BPI12_student_model_val_declare_discriminability.csv` — per-constraint scores:
+
+| column | meaning |
+|---|---|
+| `wrong_abs` | predictions the model got wrong that violated this constraint |
+| `correct_abs` | predictions the model got right that violated this constraint |
+| `net` | `wrong_abs − correct_abs` — positive means net benefit |
+| `rate_ratio` | `(wrong_rate) / (correct_rate)` — useful for ranking, but `net` drives the filter |
+
+A constraint is useful only when `net > 0`. Rate ratio alone is misleading when correct predictions far outnumber wrong ones (the typical case), because even a high ratio can produce a negative net.
+
+### Step 3 — Generate the LTN constraints module
+
+```bash
+python rules/convert_declare_to_ltn.py \
+    --dataset bpi12 \
+    --discriminability-csv data/BPI12_student_model_val_declare_discriminability.csv \
+    --min-net 1
+```
+
+Reads the discriminability CSV, keeps every constraint with `net >= --min-net`, and writes `data/rules/bpi12_ltn_constraints.py`. The generated module exposes:
+
+- `compute_level1_features(x, activity_vocab, activity_col_start, seq_len)` — returns a `[batch, N]` float tensor (1.0 = satisfied, 0.0 = violated) for all active constraints. Supports all discovered templates: `noncoexistence`, `precedence`, `altresponse`, `altprecedence`, `altsuccession`, `chain*`, and the existence-based family.
+- `build_level2_formulas(...)` — LTN SatAgg formulas (existence-based templates only).
+- `make_predicates(...)` / `make_constants(activity_vocab)` — Level 3 architecture hooks.
+
+### Step 4 — Train the LTN model
+
+```bash
+python -m predict.ltn --dataset bpi12 --level feature loss
+```
+
+Integration levels (combinable):
+
+| flag | effect |
+|---|---|
+| `feature` | constraint satisfaction scores projected as a residual into input embeddings |
+| `loss` | BCE loss + `ltn_weight × mean(output × violation_score)` penalty |
+| `intermediate` | constraint scores injected as a residual at the mid-point of the encoder |
+
+Key flags: `--ltn_weight` (default 0.5), `--hidden_size`, `--num_layers`, `--num_epochs`, `--patience`, `--seed`.
+
+### Full one-liner sequence
+
+```bash
+python rules/discover_declare.py --dataset bpi12
+python check_declare_violations.py --dataset bpi12 \
+    --predictions data/BPI12_student_model_val_prefix_predictions.csv
+python rules/convert_declare_to_ltn.py --dataset bpi12 \
+    --discriminability-csv data/BPI12_student_model_val_declare_discriminability.csv \
+    --min-net 1
+python -m predict.ltn --dataset bpi12 --level feature loss
+```

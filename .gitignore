@@ -20,6 +20,7 @@ data/prepare/bpi12_raw.csv
 # Generated rule artifacts (produced by rules/discover_declare.py)
 data/rules/*.json
 data/rules/*.txt
+data/rules/*.csv
 
 # Model checkpoints and outputs
 checkpoints/

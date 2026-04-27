@@ -1,0 +1,5 @@
+{
+  "templates": {
+    "noncoexistence": { "min_confidence": 0.95 }
+  }
+}

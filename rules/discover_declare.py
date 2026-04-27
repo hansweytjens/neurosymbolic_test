@@ -1,7 +1,20 @@
+"""
+Discover DECLARE constraints from an event log's training split.
+
+Configuration drives everything — per-template include/min_confidence/category.
+The active config is stored inside the output JSON so the checker always
+knows what settings produced the rules.
+
+Usage:
+    python rules/discover_declare.py --dataset bpi12
+    python rules/discover_declare.py --dataset bpi12 --config my_config.json
+    python rules/discover_declare.py --dataset bpi12 --save-config   # dump default config and exit
+"""
+
 import argparse
 import json
-import os
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
@@ -10,7 +23,50 @@ import pm4py
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Natural language descriptions per DECLARE template (keyed by pm4py's actual template names)
+# ── Default config ─────────────────────────────────────────────────────────────
+# Each template entry: include, min_confidence, category
+# Discovery mines at min_support + min(min_confidence for included templates),
+# then post-filters per template.
+
+DEFAULT_CONFIG = {
+    "min_support": 0.1,
+    "templates": {
+        # -- Immediate ordering (chain constraints) --------------------------------
+        "chainresponse":      {"include": True,  "min_confidence": 0.90, "category": "immediate"},
+        "chainprecedence":    {"include": True,  "min_confidence": 0.90, "category": "immediate"},
+        "chainsuccession":    {"include": True,  "min_confidence": 0.90, "category": "immediate"},
+        # -- Eventual positive ordering -------------------------------------------
+        "precedence":         {"include": True,  "min_confidence": 0.90, "category": "ordering"},
+        "altprecedence":      {"include": True,  "min_confidence": 0.90, "category": "ordering"},
+        "altresponse":        {"include": True,  "min_confidence": 0.90, "category": "ordering"},
+        "altsuccession":      {"include": True,  "min_confidence": 0.90, "category": "ordering"},
+        # -- Cross-path mutual exclusion ------------------------------------------
+        # conf=0.80 chosen empirically: gives 22.6% wrong vs 13.5% correct (1.68x)
+        "noncoexistence":     {"include": True,  "min_confidence": 0.80, "category": "cross_path"},
+        # -- Unary occurrence -----------------------------------------------------
+        "init":               {"include": True,  "min_confidence": 0.99, "category": "occurrence"},
+        "exactly_one":        {"include": True,  "min_confidence": 0.99, "category": "occurrence"},
+        "absence":            {"include": True,  "min_confidence": 0.99, "category": "occurrence"},
+        # -- Trace-level (require full trace, skipped in prefix checker) ----------
+        "existence":          {"include": False, "min_confidence": 0.90, "category": "trace_level"},
+        "responded_existence":{"include": False, "min_confidence": 0.90, "category": "trace_level"},
+        "coexistence":        {"include": False, "min_confidence": 0.90, "category": "trace_level"},
+        "response":           {"include": False, "min_confidence": 0.90, "category": "trace_level"},
+        "succession":         {"include": False, "min_confidence": 0.90, "category": "trace_level"},
+        # -- Excluded negatives (anti-discriminative: model already avoids these) -
+        "nonchainsuccession": {"include": False, "min_confidence": 0.95, "category": "excluded_negatives"},
+        "nonsuccession":      {"include": False, "min_confidence": 0.92, "category": "excluded_negatives"},
+    },
+    "categories": {
+        "immediate":          {"description": "Consecutive-pair ordering — chain constraints only"},
+        "ordering":           {"description": "Eventual positive ordering — violations detectable on prefix"},
+        "cross_path":         {"description": "Mutual exclusion across process paths — catches cross-branch errors"},
+        "occurrence":         {"description": "Unary activity presence/count — fully checkable on prefix"},
+        "trace_level":        {"description": "Require full trace — skipped in prefix checker"},
+        "excluded_negatives": {"description": "Anti-discriminative: model already avoids these patterns from training"},
+    },
+}
+
 TEMPLATE_NL = {
     "existence":           "'{0}' must occur at least once",
     "absence":             "'{0}' must not occur",
@@ -41,19 +97,42 @@ TEMPLATE_ARITY = {
     "noncoexistence": "binary", "nonsuccession": "binary", "nonchainsuccession": "binary",
 }
 
-NEGATIVE_TEMPLATES = {"absence", "noncoexistence", "nonsuccession", "nonchainsuccession"}
 
+# ── Argument parsing ───────────────────────────────────────────────────────────
 
 def get_args():
-    parser = argparse.ArgumentParser(description="Discover DECLARE rules from a processed event log")
-    parser.add_argument("--dataset",          type=str,   default="bpi12", help="Dataset name (default: bpi12)")
-    parser.add_argument("--support",          type=float, default=0.5,     help="Min support ratio (default: 0.5)")
-    parser.add_argument("--confidence",       type=float, default=0.8,     help="Min confidence ratio (default: 0.8)")
-    parser.add_argument("--positive-only",    action="store_true",         help="Exclude negative constraint templates (absence, noncoexistence, nonsuccession, nonchainsuccession)")
+    parser = argparse.ArgumentParser(
+        description="Discover DECLARE rules from a processed event log"
+    )
+    parser.add_argument("--dataset", type=str, default="bpi12",
+                        help="Dataset name (default: bpi12)")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to a JSON config overriding DEFAULT_CONFIG")
+    parser.add_argument("--save-config", action="store_true",
+                        help="Write the active config to data/rules/{dataset}_declare_config.json and exit")
     return parser.parse_args()
 
 
-def load_log(dataset):
+def load_config(path: str | None) -> dict:
+    import copy
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    if path is None:
+        return config
+    with open(path) as f:
+        override = json.load(f)
+    # Deep merge: templates and categories can be partially overridden
+    for tmpl, vals in override.get("templates", {}).items():
+        config["templates"].setdefault(tmpl, {}).update(vals)
+    for cat, vals in override.get("categories", {}).items():
+        config["categories"].setdefault(cat, {}).update(vals)
+    if "min_support" in override:
+        config["min_support"] = override["min_support"]
+    return config
+
+
+# ── Event log loading ──────────────────────────────────────────────────────────
+
+def load_log(dataset: str):
     splits_path = ROOT / "data_processed" / f"{dataset}_splits.json"
     with open(splits_path) as f:
         splits = json.load(f)
@@ -70,7 +149,9 @@ def load_log(dataset):
     return pm4py.convert_to_event_log(df)
 
 
-def to_nl(template_str, activities):
+# ── Constraint extraction ──────────────────────────────────────────────────────
+
+def to_nl(template_str: str, activities: list[str]) -> str:
     pattern = TEMPLATE_NL.get(template_str.lower(), f"{template_str}({', '.join(activities)})")
     try:
         return pattern.format(*activities)
@@ -78,36 +159,53 @@ def to_nl(template_str, activities):
         return f"{template_str}({', '.join(activities)})"
 
 
-def extract_constraints(declare_model, total_cases, positive_only=False):
-    # pm4py returns {template_str: {(act, ...): {support: count, confidence: count}}}
+def extract_constraints(declare_model, total_cases: int, config: dict) -> list[dict]:
+    """
+    Post-filter pm4py results using per-template include/min_confidence from config.
+    Only included templates that meet their per-template confidence floor are kept.
+    """
+    min_support = config["min_support"]
     constraints = []
     i = 0
+
     for template_str, entries in declare_model.items():
-        if positive_only and template_str.lower() in NEGATIVE_TEMPLATES:
+        tmpl_cfg = config["templates"].get(template_str.lower())
+        if tmpl_cfg is None or not tmpl_cfg["include"]:
             continue
+        min_conf = tmpl_cfg["min_confidence"]
+        category = tmpl_cfg["category"]
+
         for activities, vals in entries.items():
             activities = list(activities) if isinstance(activities, tuple) else [activities]
             support    = round(vals["support"]    / total_cases, 4)
             confidence = round(vals["confidence"] / vals["support"], 4) if vals["support"] else 0.0
+
+            if support < min_support or confidence < min_conf:
+                continue
+
             constraints.append({
-                "id":          f"c{i+1:04d}",
+                "id":          f"c{i + 1:04d}",
                 "template":    template_str,
                 "arity":       TEMPLATE_ARITY.get(template_str.lower(), "unknown"),
                 "activities":  activities,
                 "support":     support,
                 "confidence":  confidence,
+                "category":    category,
                 "description": to_nl(template_str, activities),
             })
             i += 1
+
     return constraints
 
 
-def save_json(constraints, dataset, support, confidence):
+# ── Output ─────────────────────────────────────────────────────────────────────
+
+def save_json(constraints: list[dict], dataset: str, config: dict):
     out_dir = ROOT / "data" / "rules"
     out_dir.mkdir(parents=True, exist_ok=True)
     output = {
-        "dataset": dataset,
-        "parameters": {"min_support": support, "min_confidence": confidence},
+        "dataset":     dataset,
+        "config":      config,
         "constraints": constraints,
     }
     path = out_dir / f"{dataset}_declare.json"
@@ -116,71 +214,111 @@ def save_json(constraints, dataset, support, confidence):
     print(f"  Machine-readable → {path}")
 
 
-def save_txt(constraints, dataset, support, confidence):
+def save_txt(constraints: list[dict], dataset: str, config: dict):
     out_dir = ROOT / "data" / "rules"
-    out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{dataset}_declare.txt"
 
-    by_template = {}
+    by_category: dict[str, list] = {}
     for c in constraints:
-        by_template.setdefault(c["template"], []).append(c)
+        by_category.setdefault(c["category"], []).append(c)
 
     with open(path, "w") as f:
         f.write(f"DECLARE Rules — {dataset.upper()}\n")
-        f.write(f"Min support: {support}  |  Min confidence: {confidence}\n")
-        f.write(f"Total constraints discovered: {len(constraints)}\n")
+        f.write(f"Min support: {config['min_support']}\n")
+        f.write(f"Total constraints: {len(constraints)}\n")
         f.write("=" * 70 + "\n\n")
 
-        for template in sorted(by_template):
-            group = sorted(by_template[template], key=lambda x: -x["support"])
-            f.write(f"[{template.upper()}]  —  {len(group)} constraint(s)\n")
+        for cat in config["categories"]:
+            group = sorted(by_category.get(cat, []), key=lambda x: (-x["confidence"], x["template"]))
+            if not group:
+                continue
+            desc = config["categories"][cat]["description"]
+            f.write(f"[{cat.upper()}]  —  {len(group)} constraint(s)\n")
+            f.write(f"  {desc}\n")
             f.write("-" * 70 + "\n")
             for c in group:
                 f.write(f"  {c['description']}\n")
-                f.write(f"  support={c['support']:.2f}  confidence={c['confidence']:.2f}\n")
+                f.write(f"  support={c['support']:.3f}  confidence={c['confidence']:.3f}\n")
             f.write("\n")
 
     print(f"  Human-readable   → {path}")
 
 
-def print_summary(constraints):
-    by_template = {}
+def print_summary(constraints: list[dict], config: dict):
+    by_category: dict[str, list] = {}
     for c in constraints:
-        by_template.setdefault(c["template"], []).append(c)
+        by_category.setdefault(c["category"], []).append(c)
 
     print(f"\n{'=' * 70}")
-    print(f"  {len(constraints)} constraints across {len(by_template)} template(s)")
+    print(f"  {len(constraints)} constraints across {len(by_category)} categories")
     print(f"{'=' * 70}")
-    for template in sorted(by_template):
-        group = sorted(by_template[template], key=lambda x: -x["support"])
-        print(f"\n[{template.upper()}]  —  {len(group)} constraint(s)")
-        print("-" * 70)
-        for c in group[:5]:
-            print(f"  {c['description']}")
-            print(f"  support={c['support']:.2f}  confidence={c['confidence']:.2f}")
-        if len(group) > 5:
-            print(f"  ... and {len(group) - 5} more (see .txt file)")
 
+    for cat in config["categories"]:
+        group = by_category.get(cat, [])
+        if not group:
+            continue
+        by_tmpl = Counter(c["template"] for c in group)
+        tmpl_summary = ", ".join(f"{t}={n}" for t, n in sorted(by_tmpl.items()))
+        print(f"\n[{cat}]  {len(group)} constraints  ({tmpl_summary})")
+        print(f"  {config['categories'][cat]['description']}")
+        for c in sorted(group, key=lambda x: -x["confidence"])[:3]:
+            print(f"  conf={c['confidence']:.3f}  {c['description'][:65]}")
+        if len(group) > 3:
+            print(f"  ... and {len(group) - 3} more")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     args = get_args()
-    print(f"Loading '{args.dataset}' event log...")
+    config = load_config(args.config)
+
+    config_out = ROOT / "data" / "rules" / f"{args.dataset}_declare_config.json"
+    if args.save_config:
+        config_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_out, "w") as f:
+            json.dump(config, f, indent=2)
+        print(f"Config written → {config_out}")
+        return
+
+    print(f"Loading '{args.dataset}' event log (training split only)...")
     log = load_log(args.dataset)
     total_cases = len(log)
-    print(f"  {total_cases} cases loaded.")
-    print(f"Discovering DECLARE constraints (support≥{args.support}, confidence≥{args.confidence})...")
+    print(f"  {total_cases} training cases loaded.")
+
+    # Mine at min_support + lowest min_confidence across all templates
+    # (pm4py uses a global threshold; per-template filtering happens in extract_constraints)
+    all_min_confs = [t["min_confidence"] for t in config["templates"].values()]
+    global_min_conf = min(all_min_confs)
+
+    included = [k for k, v in config["templates"].items() if v["include"]]
+    excluded = [k for k, v in config["templates"].items() if not v["include"]]
+    print(f"\nConfig: min_support={config['min_support']}  global_mining_conf={global_min_conf:.2f}")
+    print(f"  Included templates ({len(included)}): {', '.join(sorted(included))}")
+    print(f"  Excluded templates ({len(excluded)}): {', '.join(sorted(excluded))}")
+
+    print(f"\nMining DECLARE constraints...")
     declare_model = pm4py.discover_declare(
         log,
-        min_support_ratio=args.support,
-        min_confidence_ratio=args.confidence,
+        min_support_ratio=config["min_support"],
+        min_confidence_ratio=global_min_conf,
     )
-    constraints = extract_constraints(declare_model, total_cases, positive_only=args.positive_only)
-    constraints = [c for c in constraints if c["support"] >= args.support and c["confidence"] >= args.confidence]
-    print(f"Found {len(constraints)} constraints.\n")
-    print("Saving results...")
-    save_json(constraints, args.dataset, args.support, args.confidence)
-    save_txt(constraints, args.dataset, args.support, args.confidence)
-    print_summary(constraints)
+
+    constraints = extract_constraints(declare_model, total_cases, config)
+
+    by_cat = Counter(c["category"] for c in constraints)
+    print(f"Found {len(constraints)} constraints after per-template filtering:")
+    for cat, n in sorted(by_cat.items()):
+        tmpl_min_conf = min(
+            v["min_confidence"] for v in config["templates"].values()
+            if v["category"] == cat and v["include"]
+        )
+        print(f"  {cat:20s} {n:4d}  (min_confidence={tmpl_min_conf:.2f})")
+
+    print("\nSaving results...")
+    save_json(constraints, args.dataset, config)
+    save_txt(constraints, args.dataset, config)
+    print_summary(constraints, config)
 
 
 if __name__ == "__main__":
