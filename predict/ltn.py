@@ -311,6 +311,7 @@ if ltn_module is not None:
 
 lr = args.lr if args.lr is not None else config.learning_rate
 optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2, factor=0.5)
 criterion = nn.BCELoss()
 print(f"-- Learning rate: {lr}")
 
@@ -327,8 +328,9 @@ best_val_loss     = float("inf")
 patience_counter  = 0
 
 for epoch in range(config.num_epochs):
-    train_losses  = []
-    train_sat_agg = []
+    train_losses    = []
+    train_sat_agg   = []
+    train_ltn_contribs = []
 
     for x, y in train_loader:
         x, y = x.to(device), y.to(device)
@@ -339,15 +341,18 @@ for epoch in range(config.num_epochs):
             ltn_feats, _ = compute_batch_ltn(
                 x, compute_level1_features, activity_vocab, activity_col_start, seq_len, device
             )
+            train_sat_agg.append((ltn_feats < 1.0).any(dim=1).float().mean().item())
 
         output = model(x, ltn_feats)
         bce_loss = criterion(output.squeeze(1), y)
 
+        ltn_contrib = 0.0
         if use_ltn_feats and ltn_feats is not None and ltn_feats.numel() > 0:
-            violation_scores = 1.0 - ltn_feats.mean(dim=1)
-            train_sat_agg.append(1.0 - (output.squeeze(1).detach() * violation_scores).mean().item())
+            # binary: 1.0 for any violated constraint in the prefix, 0.0 for clean traces
+            violation_scores = (ltn_feats < 1.0).any(dim=1).float()
             if use_loss:
                 ltn_loss = (output.squeeze(1) * violation_scores).mean()
+                ltn_contrib = (args.ltn_weight * ltn_loss).item()
                 loss = bce_loss + args.ltn_weight * ltn_loss
             else:
                 loss = bce_loss
@@ -358,14 +363,17 @@ for epoch in range(config.num_epochs):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         train_losses.append(loss.item())
+        train_ltn_contribs.append(ltn_contrib)
 
     mean_train_loss = statistics.mean(train_losses)
-    mean_sat        = statistics.mean(train_sat_agg) if train_sat_agg else float("nan")
+    mean_viol_rate  = statistics.mean(train_sat_agg) if train_sat_agg else float("nan")
+    mean_ltn_contrib = statistics.mean(train_ltn_contribs) if train_ltn_contribs else 0.0
 
     print(
         f"Epoch {epoch + 1}/{config.num_epochs} | "
         f"Loss: {mean_train_loss:.4f} | "
-        f"SatAgg: {mean_sat:.4f}"
+        f"ViolRate: {mean_viol_rate:.4f} | "
+        f"LTNContrib: {mean_ltn_contrib:.5f}"
     )
     training_losses.append(mean_train_loss)
 
@@ -380,20 +388,21 @@ for epoch in range(config.num_epochs):
                 ltn_feats, _ = compute_batch_ltn(
                     x, compute_level1_features, activity_vocab, activity_col_start, seq_len, device
                 )
+                val_sat_agg.append((ltn_feats < 1.0).any(dim=1).float().mean().item())
             output   = model(x, ltn_feats)
             val_loss = criterion(output.squeeze(1), y)
-            if use_ltn_feats and ltn_feats is not None and ltn_feats.numel() > 0:
-                violation_scores = 1.0 - ltn_feats.mean(dim=1)
-                val_sat_agg.append(1.0 - (output.squeeze(1) * violation_scores).mean().item())
             val_losses.append(val_loss.item())
 
-    mean_val_loss = statistics.mean(val_losses)
-    mean_val_sat  = statistics.mean(val_sat_agg) if val_sat_agg else float("nan")
+    mean_val_loss    = statistics.mean(val_losses)
+    mean_val_viol    = statistics.mean(val_sat_agg) if val_sat_agg else float("nan")
+    current_lr       = optimizer.param_groups[0]["lr"]
     print(
         f"           Val Loss: {mean_val_loss:.4f} | "
-        f"Val SatAgg: {mean_val_sat:.4f}"
+        f"ViolRate: {mean_val_viol:.4f} | "
+        f"LR: {current_lr:.2e}"
     )
     validation_losses.append(mean_val_loss)
+    scheduler.step(mean_val_loss)
 
     if mean_val_loss < best_val_loss:
         best_val_loss = mean_val_loss
@@ -425,13 +434,10 @@ for x, y in test_loader:
             ltn_feats, _ = compute_batch_ltn(
                 x, compute_level1_features, activity_vocab, activity_col_start, seq_len, device
             )
+            test_sat_agg.append((ltn_feats < 1.0).any(dim=1).float().mean().item())
 
         outputs     = model(x, ltn_feats)
         predictions = np.where(outputs.cpu().numpy() > 0.5, 1.0, 0.0).flatten()
-
-        if use_ltn_feats and ltn_feats is not None and ltn_feats.numel() > 0:
-            violation_scores = 1.0 - ltn_feats.mean(dim=1)
-            test_sat_agg.append(1.0 - (outputs.squeeze(1) * violation_scores).mean().item())
 
         for i in range(len(y)):
             y_pred.append(predictions[i])
@@ -443,4 +449,4 @@ print("F1 Score:", f1_score(y_true, y_pred, average="macro"))
 print("Precision:", precision_score(y_true, y_pred, average="macro"))
 print("Recall:", recall_score(y_true, y_pred, average="macro"))
 if test_sat_agg:
-    print("SatAgg (test):", statistics.mean(test_sat_agg))
+    print("ViolRate (test):", statistics.mean(test_sat_agg))

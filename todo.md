@@ -1,0 +1,11 @@
+- check other types of mining (paper has three)
+- test other dataset (faster and possibly better results)
+- test all intermediate results, and force Claude to produce those and test scripts
+- sommige soorten constraints eerder in loss, andere feature of intermediate
+- fuzzy checks voor prefix constraints (ook al in eerdere test/tune phase van de constraints?)
+- weigh the constraints according to confidence/support?
+- lower LTN weight? Variable LTN weight?
+- How can the SatAgg be so high? From the first epoch?
+- There seems to be an overfitting problem. Losses for train and val differ significantly from beginning (same for BPM paper)
+- suffix prediction (seems that nep is respecting declare)
+- unbiased train-test-val split. Currently val's traces are half as long as train's which leads to problems (way less constraints firing)

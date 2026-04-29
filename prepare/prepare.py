@@ -67,6 +67,19 @@ def _transform_bpi17(df: pd.DataFrame) -> pd.DataFrame:
     raise NotImplementedError("Add BPI17 XES transform here")
 
 
+def _transform_bpi20prepaid(df: pd.DataFrame) -> pd.DataFrame:
+    # No lifecycle:transition in this log; activities are already fully named.
+
+    # Normalise org:resource to strings; fill missing
+    if "org:resource" in df.columns:
+        df["org:resource"] = df["org:resource"].fillna("UNKNOWN").astype(str)
+
+    # Label: 1 if Payment Handled appears anywhere in the case
+    paid = set(df[df["concept:name"] == "Payment Handled"]["case:concept:name"])
+    df["label"] = df["case:concept:name"].isin(paid).astype(int)
+    return df
+
+
 def _transform_sepsis(df: pd.DataFrame) -> pd.DataFrame:
     # pm4py prefixes case attributes with "case:" — rename the ones the
     # preprocessor expects without that prefix.
@@ -158,9 +171,23 @@ def _transform_traffic(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _transform_bpi20permit(df: pd.DataFrame) -> pd.DataFrame:
+    # No lifecycle:transition in this log; activities are already fully named.
+
+    if "org:resource" in df.columns:
+        df["org:resource"] = df["org:resource"].fillna("UNKNOWN").astype(str)
+
+    # Label: 1 if Payment Handled appears anywhere in the case
+    paid = set(df[df["concept:name"] == "Payment Handled"]["case:concept:name"])
+    df["label"] = df["case:concept:name"].isin(paid).astype(int)
+    return df
+
+
 _TRANSFORMS = {
     "bpi12": _transform_bpi12,
     "bpi17": _transform_bpi17,
+    "bpi20permit": _transform_bpi20permit,
+    "bpi20prepaid": _transform_bpi20prepaid,
     "sepsis": _transform_sepsis,
     "traffic": _transform_traffic,
 }

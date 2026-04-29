@@ -64,16 +64,16 @@ python rules/discover_declare.py --dataset bpi12 --config noncoex_095_override.j
 ### Step 2 — Score per-constraint discriminability (validation predictions)
 
 ```bash
-python check_declare_violations.py \
-    --dataset bpi12 \
-    --predictions data/BPI12_student_model_val_prefix_predictions.csv
+python rules/check_declare_violations.py --dataset bpi12
 ```
+
+Auto-detects the validation predictions file from `datasets/config.py` (`file_prefix` → `data/{prefix}_student_model_val_prefix_predictions.csv`). Pass `--predictions <path>` to override.
 
 Use the **validation** set, never the test set — this step selects which constraints to include, making it a form of hyperparameter tuning. Using training predictions would introduce circularity (the constraints were mined from the same data).
 
 Outputs:
-- `data/BPI12_student_model_val_declare_violation_analysis.csv` — per-row violation flags
-- `data/BPI12_student_model_val_declare_discriminability.csv` — per-constraint scores:
+- `data/{prefix}_student_model_val_declare_violation_analysis.csv` — per-row violation flags
+- `data/{prefix}_student_model_val_declare_discriminability.csv` — per-constraint scores:
 
 | column | meaning |
 |---|---|
@@ -87,11 +87,10 @@ A constraint is useful only when `net > 0`. Rate ratio alone is misleading when 
 ### Step 3 — Generate the LTN constraints module
 
 ```bash
-python rules/convert_declare_to_ltn.py \
-    --dataset bpi12 \
-    --discriminability-csv data/BPI12_student_model_val_declare_discriminability.csv \
-    --min-net 1
+python rules/convert_declare_to_ltn.py --dataset bpi12 --min-net 1
 ```
+
+Auto-detects the discriminability CSV produced in Step 2 (same `file_prefix` lookup). Pass `--discriminability-csv <path>` to override.
 
 Reads the discriminability CSV, keeps every constraint with `net >= --min-net`, and writes `data/rules/bpi12_ltn_constraints.py`. The generated module exposes:
 
@@ -117,12 +116,18 @@ Key flags: `--ltn_weight` (default 0.5), `--hidden_size`, `--num_layers`, `--num
 
 ### Full one-liner sequence
 
+Works identically for any dataset — just change the `--dataset` value:
+
 ```bash
 python rules/discover_declare.py --dataset bpi12
-python check_declare_violations.py --dataset bpi12 \
-    --predictions data/BPI12_student_model_val_prefix_predictions.csv
-python rules/convert_declare_to_ltn.py --dataset bpi12 \
-    --discriminability-csv data/BPI12_student_model_val_declare_discriminability.csv \
-    --min-net 1
+python rules/check_declare_violations.py --dataset bpi12
+python rules/convert_declare_to_ltn.py --dataset bpi12 --min-net 1
 python -m predict.ltn --dataset bpi12 --level feature loss
+```
+
+```bash
+python rules/discover_declare.py --dataset bpi20prepaid
+python rules/check_declare_violations.py --dataset bpi20prepaid
+python rules/convert_declare_to_ltn.py --dataset bpi20prepaid --min-net 1
+python -m predict.ltn --dataset bpi20prepaid --level feature loss
 ```

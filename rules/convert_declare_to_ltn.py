@@ -22,6 +22,7 @@ Usage:
     python rules/convert_declare_to_ltn.py --dataset bpi12
     python rules/convert_declare_to_ltn.py --dataset bpi12 --templates responded_existence coexistence
     python rules/convert_declare_to_ltn.py --dataset bpi12 --min-confidence 0.8 --top-k 20
+    python rules/convert_declare_to_ltn.py --dataset bpi12 --min-net 1   # auto-detects val discriminability CSV
     python rules/convert_declare_to_ltn.py --dataset bpi12 \\
         --discriminability-csv data/BPI12_student_model_val_declare_discriminability.csv \\
         --min-net 1
@@ -30,10 +31,12 @@ Usage:
 import argparse
 import csv
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
 
 EXISTENCE_TEMPLATES = {
     "existence",
@@ -101,6 +104,22 @@ def get_args():
     return parser.parse_args()
 
 
+# ── File resolution ────────────────────────────────────────────────────────────
+
+def find_discriminability_csv(dataset: str) -> Path | None:
+    """
+    Try to auto-detect the discriminability CSV produced by check_declare_violations.py.
+    Prefers the val split; falls back to test. Returns None if not found.
+    """
+    from datasets.config import get_file_prefix
+    prefix = get_file_prefix(dataset)
+    for split in ("val", "test"):
+        p = ROOT / "data" / f"{prefix}_student_model_{split}_declare_discriminability.csv"
+        if p.exists():
+            return p
+    return None
+
+
 # ── Constraint loading ─────────────────────────────────────────────────────────
 
 def load_by_discriminability(dataset: str, disc_csv: str, min_net: int) -> list[dict]:
@@ -160,13 +179,13 @@ def load_by_template(dataset: str, templates: set[str], min_confidence: float,
 
 def resolve_templates(templates_arg: list[str]) -> set[str]:
     if templates_arg == ["all"]:
-        return EXISTENCE_TEMPLATES
+        return ALL_SUPPORTED_TEMPLATES
     requested = {t.lower() for t in templates_arg}
-    unknown = requested - EXISTENCE_TEMPLATES
+    unknown = requested - ALL_SUPPORTED_TEMPLATES
     if unknown:
         raise ValueError(
-            f"Unknown or non-existence-based templates: {unknown}. "
-            f"Supported in template mode: {sorted(EXISTENCE_TEMPLATES)}"
+            f"Unknown or unsupported templates: {unknown}. "
+            f"Supported: {sorted(ALL_SUPPORTED_TEMPLATES)}"
         )
     return requested
 
@@ -450,13 +469,18 @@ def generate_module(dataset: str, constraints: list[dict], mode_desc: str) -> st
 def main():
     args = get_args()
 
-    if args.discriminability_csv:
-        constraints = load_by_discriminability(
-            args.dataset, args.discriminability_csv, args.min_net
-        )
+    disc_csv_path: str | None = args.discriminability_csv
+    if not disc_csv_path:
+        auto = find_discriminability_csv(args.dataset)
+        if auto:
+            disc_csv_path = str(auto)
+            print(f"Auto-detected discriminability CSV: {auto.name}")
+
+    if disc_csv_path:
+        constraints = load_by_discriminability(args.dataset, disc_csv_path, args.min_net)
         mode_desc = (
             f"discriminability filter  "
-            f"(csv={Path(args.discriminability_csv).name}, min_net={args.min_net})"
+            f"(csv={Path(disc_csv_path).name}, min_net={args.min_net})"
         )
     else:
         templates = resolve_templates(args.templates)

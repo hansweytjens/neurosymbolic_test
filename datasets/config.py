@@ -18,6 +18,7 @@ DATASET_REGISTRY = {
         "read_kwargs": {"dtype": {"org:resource": str}},
         "xes_file": "bpi12_extracted/BPI_Challenge_2012.xes.gz",
         "ltn_module": "data.rules.bpi12_ltn_constraints",
+        "file_prefix": "BPI12",
     },
     "bpi17": {
         "preprocessor": "data.prepare.preprocess_bpi17",
@@ -29,6 +30,7 @@ DATASET_REGISTRY = {
         "read_kwargs": {},
         "xes_file": "data/bpi17.xes.gz",
         "ltn_module": None,
+        "file_prefix": "BPI17",
     },
     "sepsis": {
         "preprocessor": "data.prepare.preprocess_sepsis",
@@ -40,6 +42,25 @@ DATASET_REGISTRY = {
         "read_kwargs": {},
         "xes_file": "data/sepsis.xes.gz",
         "ltn_module": "data.rules.sepsis_ltn_constraints",
+        "file_prefix": "sepsis",
+    },
+    "bpi20permit": {
+        "preprocessor": "data.prepare.preprocess_bpi20permit",
+        "max_prefix_length": 30,
+        "numerical_features": ["case:RequestedBudget", "case:TotalDeclared", "elapsed_time", "time_since_previous"],
+        "read_kwargs": {"dtype": {"org:resource": str}},
+        "xes_file": "data/bpi20permit.xes.gz",
+        "ltn_module": "data.rules.bpi20permit_ltn_constraints",
+        "file_prefix": "BPI20TravelPermitData",
+    },
+    "bpi20prepaid": {
+        "preprocessor": "data.prepare.preprocess_bpi20prepaid",
+        "max_prefix_length": 20,
+        "numerical_features": ["case:RequestedAmount", "elapsed_time", "time_since_previous"],
+        "read_kwargs": {"dtype": {"org:resource": str}},
+        "xes_file": "data/bpi20prepaid.xes.gz",
+        "ltn_module": "data.rules.bpi20prepaid_ltn_constraints",
+        "file_prefix": "BPI20PrepaidTravelCosts",
     },
     "traffic": {
         "preprocessor": "data.prepare.preprocess_traffic",
@@ -51,5 +72,11 @@ DATASET_REGISTRY = {
         "read_kwargs": {},
         "xes_file": "data/traffic.xes.gz",
         "ltn_module": None,
+        "file_prefix": "traffic",
     },
 }
+
+
+def get_file_prefix(dataset: str) -> str:
+    """Return the file-naming prefix for a dataset (used to locate prediction and analysis files)."""
+    return DATASET_REGISTRY[dataset].get("file_prefix", dataset.upper())

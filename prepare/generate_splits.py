@@ -17,10 +17,12 @@ from datasets.config import DATASET_REGISTRY
 # True  = create_test_set(data, seed, ratio=...)
 # False = create_test_set(data, ratio=...)  (sepsis hardcodes its own seed)
 DATASETS = {
-    "bpi12":   ("data.prepare.preprocess_bpi12",   True),
-    "bpi17":   ("data.prepare.preprocess_bpi17",   True),
-    "sepsis":  ("data.prepare.preprocess_sepsis",  False),
-    "traffic": ("data.prepare.preprocess_traffic", True),
+    "bpi12":        ("data.prepare.preprocess_bpi12",        True),
+    "bpi17":        ("data.prepare.preprocess_bpi17",        True),
+    "bpi20permit":  ("data.prepare.preprocess_bpi20permit",  True),
+    "bpi20prepaid": ("data.prepare.preprocess_bpi20prepaid", True),
+    "sepsis":       ("data.prepare.preprocess_sepsis",       False),
+    "traffic":      ("data.prepare.preprocess_traffic",      True),
 }
 
 

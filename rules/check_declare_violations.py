@@ -25,7 +25,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).parent.parent
 
 # ── Default config (must match discover_declare.py DEFAULT_CONFIG) ─────────────
 
@@ -286,12 +286,17 @@ def resolve_predictions(args_predictions: str | None, dataset: str) -> Path:
         if not p.exists():
             raise FileNotFoundError(f"Predictions file not found: {p}")
         return p
-    for prefix in (dataset, dataset.upper()):
-        p = ROOT / "data" / f"{prefix}_student_model_test_prefix_predictions.csv"
+    from datasets.config import get_file_prefix
+    prefix = get_file_prefix(dataset)
+    # Prefer val predictions (used for constraint selection / hyperparameter tuning).
+    # Fall back to test only when no val file exists.
+    for split in ("val", "test"):
+        p = ROOT / "data" / f"{prefix}_student_model_{split}_prefix_predictions.csv"
         if p.exists():
             return p
     raise FileNotFoundError(
-        f"No predictions file found for dataset '{dataset}'. "
+        f"No predictions file found for dataset '{dataset}' "
+        f"(looked for {prefix}_student_model_val/test_prefix_predictions.csv in data/). "
         "Pass --predictions <path> explicitly."
     )
 

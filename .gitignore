@@ -15,7 +15,7 @@ data/prepare/*.csv
 
 # Processed / produced datasets
 data_processed/
-data/prepare/bpi12_raw.csv
+*.csv
 
 # Generated rule artifacts (produced by rules/discover_declare.py)
 data/rules/*.json
